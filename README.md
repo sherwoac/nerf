@@ -27,6 +27,17 @@ tensorboard --logdir=logs/summaries --port=6006
 ```
 If everything works without errors, you can now go to `localhost:6006` in your browser and watch the "Fern" scene train.
 
+
+## run notebook locally 
+
+To run the notebook locally:
+```
+conda env create -f notebook_environment.yml
+conda activate nerf_notebook
+jupyter notebook tiny_nerf.ipynb
+```
+
+
 ## Setup
 
 Python 3 dependencies:
