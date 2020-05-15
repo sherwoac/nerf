@@ -569,6 +569,10 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
 
+    parser.add_argument("--image_extn",   type=str, default='.jpg',
+                        help='training image extension')
+
+
     return parser
 
 
@@ -614,7 +618,7 @@ def train():
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(
-            args.datadir, args.half_res, args.testskip)
+            args.datadir, args.half_res, args.testskip, args.image_extn)
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
