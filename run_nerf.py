@@ -569,7 +569,7 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000,
                         help='frequency of render_poses video saving')
 
-    parser.add_argument("--image_extn",   type=str, default='.jpg',
+    parser.add_argument("--image_extn",   type=str, default='.png',
                         help='training image extension')
 
 
