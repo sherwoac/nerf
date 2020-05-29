@@ -59,51 +59,51 @@ def _minify(basedir, factors=[], resolutions=[]):
         
         
         
-def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
+def _load_data(base_directory, factor=None, width=None, height=None, load_imgs=True):
     
-    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
+    poses_arr = np.load(os.path.join(base_directory, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
-    bds = poses_arr[:, -2:].transpose([1,0])
+    bounds = poses_arr[:, -2:].transpose([1, 0])
     
-    img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
+    img0 = [os.path.join(base_directory, 'images', f) for f in sorted(os.listdir(os.path.join(base_directory, 'images'))) \
             if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
-    sh = imageio.imread(img0).shape
+    image_shape = imageio.imread(img0).shape
     
     sfx = ''
     
     if factor is not None:
         sfx = '_{}'.format(factor)
-        _minify(basedir, factors=[factor])
+        _minify(base_directory, factors=[factor])
         factor = factor
     elif height is not None:
-        factor = sh[0] / float(height)
-        width = int(sh[1] / factor)
-        _minify(basedir, resolutions=[[height, width]])
+        factor = image_shape[0] / float(height)
+        width = int(image_shape[1] / factor)
+        _minify(base_directory, resolutions=[[height, width]])
         sfx = '_{}x{}'.format(width, height)
     elif width is not None:
-        factor = sh[1] / float(width)
-        height = int(sh[0] / factor)
-        _minify(basedir, resolutions=[[height, width]])
+        factor = image_shape[1] / float(width)
+        height = int(image_shape[0] / factor)
+        _minify(base_directory, resolutions=[[height, width]])
         sfx = '_{}x{}'.format(width, height)
     else:
         factor = 1
     
-    imgdir = os.path.join(basedir, 'images' + sfx)
-    if not os.path.exists(imgdir):
-        print( imgdir, 'does not exist, returning' )
+    image_directory = os.path.join(base_directory, 'images' + sfx)
+    if not os.path.exists(image_directory):
+        print(image_directory, 'does not exist, returning')
         return
     
-    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles = [os.path.join(image_directory, f) for f in sorted(os.listdir(image_directory)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     if poses.shape[-1] != len(imgfiles):
         print( 'Mismatch between imgs {} and poses {} !!!!'.format(len(imgfiles), poses.shape[-1]) )
         return
     
-    sh = imageio.imread(imgfiles[0]).shape
-    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
+    image_shape = imageio.imread(imgfiles[0]).shape
+    poses[:2, 4, :] = np.array(image_shape[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
     
     if not load_imgs:
-        return poses, bds
+        return poses, bounds
     
     def imread(f):
         if f.endswith('png'):
@@ -115,7 +115,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     imgs = np.stack(imgs, -1)  
     
     print('Loaded image data', imgs.shape, poses[:,-1,0])
-    return poses, bds, imgs
+    return poses, bounds, imgs
 
     
             

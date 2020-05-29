@@ -546,7 +546,7 @@ def config_parser():
                         help='load blender synthetic data at 400x400 instead of 800x800')
 
     # llff flags
-    parser.add_argument("--factor", type=int, default=8,
+    parser.add_argument("--factor", type=int,
                         help='downsample factor for LLFF images')
     parser.add_argument("--no_ndc", action='store_true',
                         help='do not use normalized device coordinates (set for non-forward facing scenes)')
