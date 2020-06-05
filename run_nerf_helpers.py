@@ -125,7 +125,10 @@ def get_rays(H, W, focal, c2w):
     i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
                        tf.range(H, dtype=tf.float32), indexing='xy')
     dirs = tf.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -tf.ones_like(i)], -1)
-    rays_d = tf.reduce_sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    rays_d = tf.reduce_sum(dirs[..., tf.newaxis, :] * c2w[:3, :3], -1)
+    # print(tf.reduce_sum(rays_d))
+    # rays_d = tf.tensordot(dirs, tf.transpose(c2w[:3, :3]), axes=1)
+    # print(tf.reduce_sum(rays_d))
     rays_o = tf.broadcast_to(c2w[:3, -1], tf.shape(rays_d))
     return rays_o, rays_d
 

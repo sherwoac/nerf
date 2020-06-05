@@ -1,5 +1,5 @@
 import os
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+# os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 import sys
 import tensorflow as tf
@@ -12,9 +12,7 @@ from run_nerf_helpers import *
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
-
-
-tf.compat.v1.enable_eager_execution()
+import MODELS.tf_rotations
 
 
 def batchify(fn, chunk):
@@ -27,7 +25,64 @@ def batchify(fn, chunk):
     return ret
 
 
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+def rotate_dirs_by_R(dirs, R):
+    """
+    dirs [n x 3]
+    R [3, 3]
+    return
+    transformed [n x 3]
+    """
+    R = tf.transpose(R)
+    transformed = tf.tensordot(dirs, R, axes=1)
+    return transformed
+
+
+def transpose_rotation_matrix(T):
+    R_transpose = tf.transpose(T[:3, :3])
+    return tf.concat([tf.stack([R_transpose[:3, 0], R_transpose[:3, 1], R_transpose[:3, 2], T[:3, 3]], axis=1), [[0, 0, 0, 1.]]], axis=0)
+
+
+def transform_pts_by_T(pts, T):
+    """
+    pts [n x 3]
+    T [4, 4]
+    return
+    transformed [n x 3]
+    """
+    import MODELS.rotations
+    T_transpose = T
+    # T_inv = tf.linalg.inv(T)
+    pts_plus_one = tf.concat([pts, tf.ones(shape=(pts.shape[0], 1), dtype=tf.float32)], axis=1)
+    # tf.tensordot(dirs, tf.transpose(c2w[:3, :3]), axes=1)
+    transformed_x = tf.transpose(tf.tensordot(T_transpose, tf.transpose(pts_plus_one), axes=1))
+    return transformed_x[:, :3]
+
+
+def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64, c2w=None):
+    """Prepares inputs and applies network 'fn'."""
+
+    inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
+    if c2w is not None:
+        T = tf.squeeze(MODELS.tf_rotations.label_9d_flat_and_t_to_T(c2w))
+        inputs_flat = transform_pts_by_T(inputs_flat, T)
+
+    embedded = embed_fn(inputs_flat)
+    if viewdirs is not None:
+        if c2w is not None:
+            viewdirs = rotate_dirs_by_R(viewdirs, T[:3, :3])
+            viewdirs /= tf.linalg.norm(viewdirs, axis=-1, keepdims=True)
+        input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
+        input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        embedded_dirs = embeddirs_fn(input_dirs_flat)
+        embedded = tf.concat([embedded, embedded_dirs], -1)
+
+    outputs_flat = batchify(fn, netchunk)(embedded)
+    outputs = tf.reshape(outputs_flat, list(
+        inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    return outputs
+
+
+def run_network_c2w(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64, c2w=None):
     """Prepares inputs and applies network 'fn'."""
 
     inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
@@ -43,7 +98,6 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
-
 
 def render_rays(ray_batch,
                 network_fn,
@@ -247,7 +301,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
-        print(f'i:{i}')
+        # print(f'i:{i} / {rays_flat.shape[0]}')
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
             if k not in all_ret:
@@ -395,6 +449,8 @@ def create_nerf(args):
     grad_vars = model.trainable_variables
     models = {'model': model}
 
+
+
     model_fine = None
     if args.N_importance > 0:
         model_fine = init_nerf_model(
@@ -408,7 +464,8 @@ def create_nerf(args):
         inputs, viewdirs, network_fn,
         embed_fn=embed_fn,
         embeddirs_fn=embeddirs_fn,
-        netchunk=args.netchunk)
+        netchunk=args.netchunk,
+        c2w=args.c2w if hasattr(args, 'c2w') else None)
 
     render_kwargs_train = {
         'network_query_fn': network_query_fn,
@@ -930,4 +987,5 @@ def train():
 
 
 if __name__ == '__main__':
+    tf.compat.v1.enable_eager_execution()
     train()
