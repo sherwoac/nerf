@@ -1,4 +1,4 @@
-expname = linemod_driller_back_to_eggbox_similar_layout
+expname = linemod_driller_back_to_eggbox_similar_layout_no_ndc
 basedir = ./logs
 datadir = ./data/linemod_driller_back_to_eggbox_similar_layout
 dataset_type = llff
@@ -12,6 +12,7 @@ N_importance = 64
 use_viewdirs = True
 raw_noise_std = 0
 # lrate = 0.0005
-lrate = 0.001
-ft_path = ./logs/linemod_driller_back_to_eggbox_similar_layout/model_680000.npy
+lrate = 0.01
+# ft_path = ./logs/linemod_driller_back_to_eggbox_similar_layout_no_ndc/model_470000.npy
 no_ndc = True
+lindisp = False

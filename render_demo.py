@@ -43,7 +43,7 @@ def show_test_images_at_c2w(Ts, test_image, render_kwargs, titles=[]):
 
 
 basedir = './logs'
-expname = 'linemod_driller_back_to_eggbox_similar_layout'
+expname = 'linemod_driller_back_to_eggbox_similar_layout_no_ndc'
 
 exp_dir = os.path.join(basedir, expname) 
 config = os.path.join(exp_dir, 'config.txt')
@@ -51,7 +51,7 @@ print('Args:')
 print(open(config, 'r').read())
 parser = run_nerf.config_parser()
 
-args = parser.parse_args('--config {} --ft_path {}'.format(config, os.path.join(basedir, expname, 'model_680000.npy')))
+args = parser.parse_args('--config {} --ft_path {}'.format(config, os.path.join(basedir, expname, 'model_470000.npy')))
 print('loaded args')
 
 images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor, 
@@ -78,7 +78,10 @@ else:
 
 
 # Create nerf model
+import json
+json.dump(vars(args), open("/tmp/args.json", 'w'))
 _, render_kwargs_test, start, grad_vars, models = run_nerf.create_nerf(args)
+
 
 bds_dict = {
     'near' : tf.cast(near, tf.float32),
@@ -92,10 +95,10 @@ pprint.pprint(render_kwargs_test)
 
 down = 1
 render_kwargs_fast = {k : render_kwargs_test[k] for k in render_kwargs_test}
-render_kwargs_fast['N_importance'] = 64
+render_kwargs_fast['N_importance'] = 0
 
-# c2w = np.eye(4)[:3,:4].astype(np.float32) # identity pose matrix
-c2w = poses[i_test, :3, :4].astype(np.float32)
+c2w = np.eye(4)[:3,:4].astype(np.float32) # identity pose matrix
+# c2w = poses[i_test, :3, :4].astype(np.float32)
 
 print('Render kwargs:')
 pprint.pprint(render_kwargs_fast)

@@ -47,11 +47,14 @@ def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=
 
 
 def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100):
-    H, W, focal = test_image.shape[0], test_image.shape[1], 584.
+    down = 1
+    H, W, focal = test_image.shape[0]//down, test_image.shape[1]//down, 584./down
     optimizer = tf.keras.optimizers.Adam(args.lrate)
     no_initial_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
     # no_initial_transformation = test_T[:3, :4].astype(np.float32)  # identity pose matrix
-
+    loss_list = []
+    rotation_difference = []
+    translation_difference = []
     for epoch in range(epochs):
         rays_rgb = create_ray_batches(H, W, focal, np.expand_dims(test_image, axis=0),
                                       np.expand_dims(no_initial_transformation, axis=0), seed=epoch, shuffle=True)
@@ -83,16 +86,33 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
             optimizer.apply_gradients(zip(gradients, grad_vars))
             T = np.squeeze(MODELS.rotations.np_rotation_9d_flat_to_transformation_matrix(grad_vars[0].numpy())).astype(np.float32)
             diff = MODELS.rotations.compare_poses(T, test_T)
+            loss_list.append(loss.numpy())
+            rotation_difference.append(diff[0])
+            translation_difference.append(diff[1])
+
             print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} psnr: {psnr:1f} diff: {diff[0] * 180. / np.pi:1f}deg {diff[1]:1f}m')
 
+    plt.plot(loss_list, label='loss')
+    plt.plot(rotation_difference, label='rotation_difference')
+    plt.plot(translation_difference, label='translation_difference')
+    plt.legend()
+    plt.show()
     return T
 
 
 def render_both_ways(args, T, H, W, focal):
     # c2w in rays
     render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
-    down = 1
+
+    bds_dict = {
+        'near': args.near,
+        'far': args.far,
+    }
+    render_kwargs_test.update(bds_dict)
+
+    down = 8
     c2w_first_rgb, _, _, _ = rn.render(H // down, W // down, focal // down, c2w=T, **render_kwargs_test)
+
     # c2w in network
     args.c2w = tf.Variable(
                 MODELS.rotations.np_transformation_matrix_to_9d_flat(
@@ -102,10 +122,17 @@ def render_both_ways(args, T, H, W, focal):
 
     eye = np.eye(4, dtype=np.float32)[:3, :4]
     render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
+    bds_dict = {
+        'near': args.near,
+        'far': args.far,
+    }
+    render_kwargs_test.update(bds_dict)
+
     c2w_network_rgb, _, _, _ = rn.render(H // down, W // down, focal // down, c2w=eye, **render_kwargs_test)
-    # tiled_images = OUTPUT.image_tools.tile_images(np.array([[255.*np.clip(c2w_first_rgb.numpy(), 0, 1), 255.*np.clip(c2w_network_rgb.numpy(), 0, 1)]]))
-    tiled_images = OUTPUT.image_tools.tile_images(
-        np.array([[255. * c2w_first_rgb.numpy(), 255. * c2w_network_rgb.numpy()]]))
+
+    tiled_images = OUTPUT.image_tools.tile_images(np.array([[255.*np.clip(c2w_first_rgb.numpy(), 0, 1), 255.*np.clip(c2w_network_rgb.numpy(), 0, 1)]]))
+    # tiled_images = OUTPUT.image_tools.tile_images(
+    #     np.array([[255. * c2w_first_rgb.numpy(), 255. * c2w_network_rgb.numpy()]]))
     plt.imshow(tiled_images)
     plt.suptitle(','.join(['c2w_first_rgb', 'c2w_network_rgb']))
     plt.show()
@@ -195,15 +222,10 @@ def show_test_images_at_c2w(Ts, test_image, render_kwargs, titles=[]):
     plt.show()
 
 
-def train_on_one_image(args):
-    # i_test = 0
-    # initial camera to world transformation
-    # test_pose =
+def train_on_one_image(args, i_test):
     initial_pose = np.eye(4, dtype=np.float32)
-    # initial_pose = test_pose
-
-    # args.c2w = None
     test_pose = np.r_[poses[i_test][:, :4], [[0., 0., 0., 1.]]].astype(np.float32)
+    # initial_pose = test_pose
     args.c2w = tf.Variable(
         MODELS.rotations.np_transformation_matrix_to_9d_flat(
             np.expand_dims(initial_pose, axis=0)
@@ -213,25 +235,30 @@ def train_on_one_image(args):
     render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
     # per step:
     test_image = images[i_test]
-    near = 0.
-    far = 1.5
 
     bds_dict = {
-        'near': tf.cast(near, tf.float32),
-        'far': tf.cast(far, tf.float32),
+        'near': args.near,
+        'far': args.far
     }
     render_kwargs_test.update(bds_dict)
 
     pprint.pprint(render_kwargs_test)
     # print(f'diff: {MODELS.rotations.compare_rotations(test_pose, initial_pose) * 180. / np.pi:.2f}deg')
     predicted_c2w = optimize_model_to_single_image(args, test_image, render_kwargs_test, [args.c2w], test_pose,
-                                                   epochs=1)
-    show_test_images_at_c2w([initial_pose, predicted_c2w],
+                                                   epochs=10)
+    args.c2w = tf.Variable(
+        MODELS.rotations.np_transformation_matrix_to_9d_flat(
+            np.expand_dims(initial_pose, axis=0)
+        ),
+        name='c2w')
+    show_test_images_at_c2w([initial_pose, test_pose, predicted_c2w],
                             test_image,
                             render_kwargs_test,
-                            titles=[f'i_test:{i_test}', 'test_image', 'initial_pose', 'predicted_c2w'])
+                            titles=[f'i_test:{i_test}', 'test_image', 'initial_pose', 'test_pose', 'predicted_pose'])
 
     diff = MODELS.rotations.compare_poses(test_pose, predicted_c2w)
+    print(test_pose)
+    print(predicted_c2w)
     print(f'i_test: {i_test} diff: {diff[0] * 180. / np.pi:1f}deg {diff[1]:1f}')
 
 
@@ -248,31 +275,20 @@ if __name__ == '__main__':
     i_test = 2
     # test_pose = poses[i_test, :3, :4]
     test_pose = np.eye(4, dtype=np.float32)
-    test_pose = MODELS.rotations.translate_Z(MODELS.rotations.rotate_about_X(test_pose, 0.).astype(np.float32), .0)[:3, :4]
+    test_pose = MODELS.rotations.translate_Z(MODELS.rotations.rotate_about_X(test_pose, -10.).astype(np.float32), .0)[:3, :4]
 
     test_image = images[i_test]
     H, W, focal = test_image.shape[0], test_image.shape[1], 584.
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
+    # render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
     # per step:
     test_image = images[i_test]
-    near = 0.
-    far = 1.
-
-    bds_dict = {
-        'near': tf.cast(near, tf.float32),
-        'far': tf.cast(far, tf.float32),
-    }
-    render_kwargs_test.update(bds_dict)
-
+    near = tf.reduce_min(bds) * .9
+    far = tf.reduce_max(bds) * 1.
+    args.near = tf.cast(near, tf.float32)
+    args.far = tf.cast(far, tf.float32)
     print('Render kwargs:')
 
-    render_kwargs_test['N_importance'] = 0
-    render_kwargs_test['N_samples'] = 1
-    pprint.pprint(render_kwargs_test)
     # show_test_images_at_c2w([poses[i_test, :3, :4]], test_image, render_kwargs_test)
-    render_both_ways(args, test_pose, H, W, focal)
-    # pts = np.eye(3, dtype=np.float32)
-    # print(rn.transform_pts_by_T(pts, test_pose))
-    # render_both_ways(args, np.eye(4, dtype=np.float32)[:3, :4], H, W, focal)
-
+    # render_both_ways(args, test_pose, H, W, focal)
+    train_on_one_image(args, i_test)
