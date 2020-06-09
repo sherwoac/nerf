@@ -9,7 +9,7 @@ import json
 import random
 import time
 from run_nerf_helpers import *
-from load_llff import load_llff_data
+from load_llff import load_llff_data, load_masks
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 import MODELS.tf_rotations
@@ -630,6 +630,8 @@ def config_parser():
     parser.add_argument("--image_extn",   type=str, default='.png',
                         help='training image extension')
 
+    parser.add_argument("--mask_directory",   type=str, default=None,
+                        help='mask_directory')
 
     return parser
 
@@ -650,6 +652,7 @@ def train():
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
                                                                   spherify=args.spherify)
+
         hwf = poses[0, :3, -1]
         poses = poses[:, :3, :4]
         print('Loaded llff', images.shape,
@@ -673,6 +676,10 @@ def train():
             near = 0.
             far = 1.
         print('NEAR FAR', near, far)
+
+        if args.mask_directory:
+            assert os.path.isdir(args.mask_directory), f'args.mask_directory not found at: {args.mask_directory}'
+            masks = load_masks(args.datadir, args.mask_directory)
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split = load_blender_data(
@@ -797,6 +804,10 @@ def train():
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
         rays_rgb = np.stack([rays_rgb[i]
                              for i in i_train], axis=0)  # train images only
+        if args.mask_directory:
+            train_masks = np.stack([masks[i] for i in i_train], axis=0)
+            rays_rgb = rays_rgb[np.where(train_masks)]
+
         # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
         rays_rgb = rays_rgb.astype(np.float32)

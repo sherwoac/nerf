@@ -1,6 +1,7 @@
+import re
 import numpy as np
 import os, imageio
-
+import imageio
 
 ########## Slightly modified version of LLFF data loading code 
 ##########  see https://github.com/Fyusion/LLFF for original
@@ -55,18 +56,37 @@ def _minify(basedir, factors=[], resolutions=[]):
             check_output('rm {}/*.{}'.format(imgdir, ext), shell=True)
             print('Removed duplicates')
         print('Done')
-            
-        
-        
-        
-def _load_data(base_directory, factor=None, width=None, height=None, load_imgs=True):
-    
+
+
+def get_list_of_image_filenames(base_directory):
+    return [os.path.join(base_directory, 'images', f) for f in
+                               sorted(os.listdir(os.path.join(base_directory, 'images'))) \
+                               if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+
+
+def load_masks(base_directory, mask_directory):
+    list_of_image_filenames = get_list_of_image_filenames(base_directory)
+    masks = []
+    for meta_filename in list_of_image_filenames:
+        frame_number = int(re.findall(r'\d+', meta_filename)[-1])
+        mask_filename = os.path.join(mask_directory, str(frame_number).zfill(4) + '.png')
+        assert os.path.isfile(mask_filename), f'mask_filename not found at: {mask_filename}'
+        mask = imageio.imread(mask_filename)
+        bool_mask = (mask > 0)
+        masks.append(bool_mask[:, :, 0])
+
+    masks = np.stack(masks, axis=0)
+    return masks
+
+
+def _load_data(base_directory, factor=None, width=None, height=None, load_imgs=True, mask_directory=None):
     poses_arr = np.load(os.path.join(base_directory, 'poses_bounds.npy'))
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
     bounds = poses_arr[:, -2:].transpose([1, 0])
-    
-    img0 = [os.path.join(base_directory, 'images', f) for f in sorted(os.listdir(os.path.join(base_directory, 'images'))) \
-            if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
+
+    list_of_image_filenames = get_list_of_image_filenames(base_directory)
+
+    img0 = list_of_image_filenames[0]
     image_shape = imageio.imread(img0).shape
     
     sfx = ''
@@ -112,8 +132,8 @@ def _load_data(base_directory, factor=None, width=None, height=None, load_imgs=T
             return imageio.imread(f)
         
     imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
-    imgs = np.stack(imgs, -1)  
-    
+    imgs = np.stack(imgs, -1)
+
     print('Loaded image data', imgs.shape, poses[:,-1,0])
     return poses, bounds, imgs
 

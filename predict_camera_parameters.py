@@ -46,19 +46,18 @@ def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=
         return rays_rgb
 
 
-def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100):
-    down = 1
+def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100, down=16):
     H, W, focal = test_image.shape[0]//down, test_image.shape[1]//down, 584./down
     optimizer = tf.keras.optimizers.Adam(args.lrate)
-    no_initial_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
-    # no_initial_transformation = test_T[:3, :4].astype(np.float32)  # identity pose matrix
+    identity_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
     loss_list = []
     rotation_difference = []
     translation_difference = []
+    downsampled_image = downsample_image(np.copy(test_image), down)
     for epoch in range(epochs):
-        rays_rgb = create_ray_batches(H, W, focal, np.expand_dims(test_image, axis=0),
-                                      np.expand_dims(no_initial_transformation, axis=0), seed=epoch, shuffle=True)
-        number_of_batches = rays_rgb.shape[0] // args.N_rand
+        rays_rgb = create_ray_batches(H, W, focal, np.expand_dims(downsampled_image, axis=0),
+                                      np.expand_dims(identity_transformation, axis=0), seed=epoch, shuffle=True)
+        number_of_batches = max(rays_rgb.shape[0] // args.N_rand, 1)
         for i_batch in range(number_of_batches):
             with tf.GradientTape() as tape:
                 # Random over all image
@@ -208,7 +207,7 @@ def try_render_demo():
 
 
 def show_test_images_at_c2w(Ts, test_image, render_kwargs, titles=[]):
-    H, W, focal = test_image.shape[0], test_image.shape[1], 584.
+    H, W, focal = test_image.shape[0], test_image.shape[1], 584. * test_image.shape[0] / 480.
     image_list = [255. * test_image]
     for T in Ts:
         # render_kwargs.c2w = np.eye(4, dtype=np.float32)
@@ -222,9 +221,23 @@ def show_test_images_at_c2w(Ts, test_image, render_kwargs, titles=[]):
     plt.show()
 
 
+def downsample_image(image, down):
+    import tensorflow as tf
+    H, W = image.shape[0], image.shape[1]
+    downsampled_image = tf.image.resize(np.expand_dims(image, axis=0), [H // down, W // down]).numpy()
+    return downsampled_image[0]
+
+
 def train_on_one_image(args, i_test):
-    initial_pose = np.eye(4, dtype=np.float32)
+    identity_pose = np.eye(4, dtype=np.float32)
+    tf_identity_pose = tf.Variable(
+        MODELS.rotations.np_transformation_matrix_to_9d_flat(
+            np.expand_dims(identity_pose, axis=0)
+        ),
+        name='c2w')
     test_pose = np.r_[poses[i_test][:, :4], [[0., 0., 0., 1.]]].astype(np.float32)
+    initial_pose = MODELS.rotations.translate_Z(MODELS.rotations.rotate_about_X(test_pose, 8.).astype(np.float32), .0)[
+                :3, :4]
     # initial_pose = test_pose
     args.c2w = tf.Variable(
         MODELS.rotations.np_transformation_matrix_to_9d_flat(
@@ -244,13 +257,22 @@ def train_on_one_image(args, i_test):
 
     pprint.pprint(render_kwargs_test)
     # print(f'diff: {MODELS.rotations.compare_rotations(test_pose, initial_pose) * 180. / np.pi:.2f}deg')
-    predicted_c2w = optimize_model_to_single_image(args, test_image, render_kwargs_test, [args.c2w], test_pose,
-                                                   epochs=10)
-    args.c2w = tf.Variable(
-        MODELS.rotations.np_transformation_matrix_to_9d_flat(
-            np.expand_dims(initial_pose, axis=0)
-        ),
-        name='c2w')
+    for downsample in [4, 2, 1]:
+        predicted_c2w = optimize_model_to_single_image(args, test_image, render_kwargs_test, [args.c2w], test_pose, epochs=99, down=downsample)
+        downsampled_image = downsample_image(np.copy(test_image), downsample)
+        args.c2w = tf_identity_pose
+        show_test_images_at_c2w([initial_pose, test_pose, predicted_c2w],
+                                downsampled_image,
+                                render_kwargs_test,
+                                titles=[f'downsample:{downsample}', 'test_image', 'initial_pose', 'test_pose', 'predicted_pose'])
+
+        args.c2w = tf.Variable(
+            MODELS.rotations.np_transformation_matrix_to_9d_flat(
+                np.expand_dims(predicted_c2w, axis=0)
+            ),
+            name='c2w')
+
+    args.c2w = tf_identity_pose
     show_test_images_at_c2w([initial_pose, test_pose, predicted_c2w],
                             test_image,
                             render_kwargs_test,
