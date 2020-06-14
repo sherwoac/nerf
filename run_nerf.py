@@ -262,7 +262,7 @@ def render_rays(ray_batch,
         raw, z_vals, rays_d)
 
     if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map_0, disp_map_0, acc_map_0, depth_map_0 = rgb_map, disp_map, acc_map, depth_map
 
         # Obtain additional integration times to evaluate based on the weights
         # assigned to colors in the coarse model.
@@ -282,13 +282,14 @@ def render_rays(ray_batch,
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
 
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'depth_map': depth_map}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
+        ret['depth_map'] = depth_map_0
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
 
     for k in ret:
@@ -633,7 +634,29 @@ def config_parser():
     parser.add_argument("--mask_directory",   type=str, default=None,
                         help='mask_directory')
 
+    parser.add_argument("--mask_images", action='store_true',
+                        help='mask_images')
+
+    parser.add_argument("--ray_masking", action='store_true',
+                        help='ray_masking')
+
+    parser.add_argument("--sigma_masking", action='store_true',
+                        help='sigma_masking')
+
+    parser.add_argument("--sigma_threshold", type=float, default=0., help='sigma_threshold')
+
+    parser.add_argument("--depth_directory", type=str, default=None, help='depth_directory')
+
     return parser
+
+
+def unison_shuffled_copies(list_of_arrays: list):
+    len_first = len(list_of_arrays[0])
+    for _array in list_of_arrays:
+        assert len_first == len(_array)
+
+    p = np.random.permutation(len_first)
+    return [_array[p] for _array in list_of_arrays]
 
 
 def train():
@@ -677,19 +700,21 @@ def train():
             far = 1.
         print('NEAR FAR', near, far)
 
-        if args.mask_directory:
-            assert os.path.isdir(args.mask_directory), f'args.mask_directory not found at: {args.mask_directory}'
-            masks = load_masks(args.datadir, args.mask_directory)
-
     elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(
-            args.datadir, args.half_res, args.testskip, args.image_extn)
+        if args.mask_directory is not None:
+            images, poses, render_poses, hwf, i_split, masks = load_blender_data(
+                args.datadir, args.half_res, args.testskip, args.image_extn, mask_directory=args.mask_directory)
+        else:
+            images, poses, render_poses, hwf, i_split = load_blender_data(
+                args.datadir, args.half_res, args.testskip, args.image_extn)
+
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
-        near = 2.
-        far = 6.
+        Zs = poses[:, 2, 3]
+        near = np.min(Zs) * 0.9
+        far = np.max(Zs) * 1.1
 
         if args.white_bkgd:
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
@@ -713,6 +738,12 @@ def train():
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
+
+
+    if args.mask_directory:
+        assert os.path.isdir(args.mask_directory), f'args.mask_directory not found at: {args.mask_directory}'
+        if args.mask_images:
+            images *= masks[..., np.newaxis]
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -802,17 +833,23 @@ def train():
         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
         # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
-        rays_rgb = np.stack([rays_rgb[i]
-                             for i in i_train], axis=0)  # train images only
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
+
         if args.mask_directory:
             train_masks = np.stack([masks[i] for i in i_train], axis=0)
-            rays_rgb = rays_rgb[np.where(train_masks)]
+            pixel_train_masks = train_masks.ravel()
+            if args.ray_masking:
+                rays_rgb = rays_rgb[np.where(train_masks)]
+
 
         # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
-        np.random.shuffle(rays_rgb)
+        if args.mask_directory and args.sigma_masking:
+            rays_rgb, pixel_train_masks = unison_shuffled_copies([rays_rgb, pixel_train_masks])
+        else:
+            np.random.shuffle(rays_rgb)
         print('done')
         i_batch = 0
 
@@ -836,14 +873,19 @@ def train():
             # Random over all images
             batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
             batch = tf.transpose(batch, [1, 0, 2])
-
+            if args.sigma_masking:
+                in_mask_pixels_batch = pixel_train_masks[i_batch: i_batch + N_rand]
             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
             # target_s[n, rgb] = example_id, observed color.
             batch_rays, target_s = batch[:2], batch[2]
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
-                np.random.shuffle(rays_rgb)
+                if args.mask_directory and args.sigma_masking:
+                    rays_rgb, pixel_train_masks = unison_shuffled_copies([rays_rgb, pixel_train_masks])
+                else:
+                    np.random.shuffle(rays_rgb)
+
                 i_batch = 0
 
         else:
@@ -885,14 +927,22 @@ def train():
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
-            img_loss = img2mse(rgb, target_s)
+            if args.sigma_masking:
+                img_loss = img2mse(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
+            else:
+                img_loss = img2mse(rgb, target_s)
             trans = extras['raw'][..., -1]
             loss = img_loss
             psnr = mse2psnr(img_loss)
+            if args.sigma_masking:
+                loss += 0.01 * tf.reduce_sum((~in_mask_pixels_batch) * acc) / N_rand
 
             # Add MSE loss for coarse-grained model
             if 'rgb0' in extras:
-                img_loss0 = img2mse(extras['rgb0'], target_s)
+                if args.sigma_masking:
+                    img_loss0 = img2mse(extras['rgb0'][in_mask_pixels_batch], target_s[in_mask_pixels_batch])
+                else:
+                    img_loss0 = img2mse(extras['rgb0'], target_s)
                 loss += img_loss0
                 psnr0 = mse2psnr(img_loss0)
 
@@ -947,7 +997,7 @@ def train():
         if i % args.i_print == 0 or i < 10:
 
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
+            # print('iter time {:.05f}'.format(dt))
             with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
                 tf.contrib.summary.scalar('loss', loss)
                 tf.contrib.summary.scalar('psnr', psnr)
@@ -969,8 +1019,7 @@ def train():
                 
                 # Save out the validation image for Tensorboard-free monitoring
                 testimgdir = os.path.join(basedir, expname, 'tboard_val_imgs')
-                if i==0:
-                    os.makedirs(testimgdir, exist_ok=True)
+                os.makedirs(testimgdir, exist_ok=True)
                 imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
 
                 with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):

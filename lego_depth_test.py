@@ -356,6 +356,9 @@ def train_on_one_image(args, images, masks, i_test, depth_images):
     print(f'i_test: {i_test} diff: {diff[0] * 180. / np.pi:1f}deg {diff[1]:1f}')
 
 
+
+
+
 def render_depth_mask(args, T, H, W, focal, depth_image, mask):
     # c2w in network
     args.c2w = tf.Variable(
@@ -399,6 +402,9 @@ def render_depth_mask(args, T, H, W, focal, depth_image, mask):
     # plt.imshow(tiled_images)
     # plt.suptitle(','.join(['c2w_first_rgb', 'c2w_network_rgb']))
     # plt.show()
+
+def compare_lego_depths():
+    render_depth()
 
 
 if __name__ == '__main__':

@@ -4,6 +4,7 @@ import numpy as np
 import imageio 
 import json
 
+from load_llff import load_masks
 
 
 
@@ -38,7 +39,7 @@ def pose_spherical(theta, phi, radius):
     
 
 
-def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png'):
+def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -48,19 +49,29 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png'):
     all_imgs = []
     all_poses = []
     counts = [0]
+    filenames = []
     for s in splits:
         meta = metas[s]
         imgs = []
         poses = []
+        depth_maps = []
         if s=='train' or testskip==0:
             skip = 1
         else:
             skip = testskip
-            
+
         for frame in meta['frames'][::skip]:
             fname = os.path.join(basedir, frame['file_path'] + image_extn)
+            filenames.append(fname)
             imgs.append(imageio.imread(fname))
             poses.append(np.array(frame['transform_matrix']))
+            # if get_depths and s == 'test':
+                #eg. r_0_depth_0001.png
+                # depth_filename = os.path.join(basedir, frame['file_path'] + '_depth_0001' + image_extn)
+                # depth = imageio.imread(depth_filename)
+                # depth_values = depth[:, :, 0]
+                # depth_maps.append(depth_values)
+
         imgs = (np.array(imgs) / 255.).astype(np.float32) # keep all 4 channels (RGBA)
         poses = np.array(poses).astype(np.float32)
         counts.append(counts[-1] + imgs.shape[0])
@@ -68,7 +79,10 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png'):
         all_poses.append(poses)
     
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
-    
+
+    if mask_directory is not None:
+        masks = load_masks(basedir, mask_directory, filenames)
+
     imgs = np.concatenate(all_imgs, 0)
     poses = np.concatenate(all_poses, 0)
     
@@ -84,6 +98,13 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png'):
         W = W//2
         focal = focal/2.
         
+    if get_depths:
+        return imgs, poses, render_poses, [H, W, focal], i_split, depth_maps
+
+    if mask_directory is not None:
+        return imgs, poses, render_poses, [H, W, focal], i_split, masks
+
     return imgs, poses, render_poses, [H, W, focal], i_split
+
 
 

@@ -49,7 +49,8 @@ def get_records(list_of_ids: list, image_dir, label_dir):
         example_image_filename = os.path.join(image_dir, f'color{list_of_ids[0]}.jpg')
         example_image = iio.imread(example_image_filename)
         H, W = example_image.shape[:2]
-        camera_angle_x = linemod_camera_intrinsics[0, 0] / W
+        # =2 * ATAN(W / (2 * f))
+        camera_angle_x = 2.*np.arctan2(W, 2.*linemod_camera_intrinsics[0, 0])
         return camera_angle_x
 
     camera_angle_x = get_camera_angle_x()
@@ -58,9 +59,9 @@ def get_records(list_of_ids: list, image_dir, label_dir):
         image_filename = os.path.join(image_dir, f'color{id}.jpg')
         translation_filename = os.path.join(label_dir, f'tra{id}.tra')
         rotation_filename = os.path.join(label_dir, f'rot{id}.rot')
-        T_co_rdf = parse_linemod_pose(translation_filename, rotation_filename)
-        T_oc_rub = np.linalg.inv(rub_to_rdf(T_co_rdf))
-        dataset_records.append(DatasetItem(image_filename, T_oc_rub, camera_angle_x))
+        T = parse_linemod_pose(translation_filename, rotation_filename)
+        # T_oc_rub = np.linalg.inv(T_co_rdf))
+        dataset_records.append(DatasetItem(image_filename, rub_to_rdf(np.linalg.inv(T)), camera_angle_x))
 
     return dataset_records, camera_angle_x
 

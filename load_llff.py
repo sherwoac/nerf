@@ -64,8 +64,10 @@ def get_list_of_image_filenames(base_directory):
                                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
 
 
-def load_masks(base_directory, mask_directory):
-    list_of_image_filenames = get_list_of_image_filenames(base_directory)
+def load_masks(base_directory, mask_directory, list_of_image_filenames=None):
+    if list_of_image_filenames is None:
+        list_of_image_filenames = get_list_of_image_filenames(base_directory)
+
     masks = []
     for meta_filename in list_of_image_filenames:
         frame_number = int(re.findall(r'\d+', meta_filename)[-1])
@@ -77,6 +79,12 @@ def load_masks(base_directory, mask_directory):
 
     masks = np.stack(masks, axis=0)
     return masks
+
+
+
+
+
+
 
 
 def _load_data(base_directory, factor=None, width=None, height=None, load_imgs=True, mask_directory=None):
