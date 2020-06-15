@@ -38,6 +38,17 @@ def pose_spherical(theta, phi, radius):
     return c2w
     
 
+def linemod_dpt(path):
+    """
+    read a depth image
+
+    @return uint16 image of distance in [mm]"""
+    dpt = open(path, "rb")
+    rows = np.frombuffer(dpt.read(4), dtype=np.int32)[0]
+    cols = np.frombuffer(dpt.read(4), dtype=np.int32)[0]
+
+    return np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols)) / 1000.
+
 
 def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None):
     splits = ['train', 'val', 'test']
@@ -48,6 +59,7 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
 
     all_imgs = []
     all_poses = []
+    all_depth_maps = []
     counts = [0]
     filenames = []
     for s in splits:
@@ -65,19 +77,23 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
             filenames.append(fname)
             imgs.append(imageio.imread(fname))
             poses.append(np.array(frame['transform_matrix']))
-            # if get_depths and s == 'test':
+            if get_depths and 'depth_path' in frame:
                 #eg. r_0_depth_0001.png
-                # depth_filename = os.path.join(basedir, frame['file_path'] + '_depth_0001' + image_extn)
-                # depth = imageio.imread(depth_filename)
-                # depth_values = depth[:, :, 0]
-                # depth_maps.append(depth_values)
+                filename = frame['depth_path']
+                assert os.path.isfile(filename), f'filename:{filename} not found'
+                if '.png' in filename:
+                    depth = imageio.imread(filename)
+                elif '.dpt' in filename:
+                    depth = linemod_dpt(filename)
+                depth_maps.append(depth)
 
         imgs = (np.array(imgs) / 255.).astype(np.float32) # keep all 4 channels (RGBA)
         poses = np.array(poses).astype(np.float32)
         counts.append(counts[-1] + imgs.shape[0])
         all_imgs.append(imgs)
         all_poses.append(poses)
-    
+        all_depth_maps.append(depth_maps)
+
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
 
     if mask_directory is not None:
@@ -97,14 +113,16 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         H = H//2
         W = W//2
         focal = focal/2.
-        
+
+    extras = {}
     if get_depths:
-        return imgs, poses, render_poses, [H, W, focal], i_split, depth_maps
+        all_depth_maps = np.concatenate(all_depth_maps, 0)
+        extras['depth_maps'] = np.stack(all_depth_maps, axis=0)
 
     if mask_directory is not None:
-        return imgs, poses, render_poses, [H, W, focal], i_split, masks
+        extras['masks'] = masks
 
-    return imgs, poses, render_poses, [H, W, focal], i_split
+    return imgs, poses, render_poses, [H, W, focal], i_split, extras
 
 
 

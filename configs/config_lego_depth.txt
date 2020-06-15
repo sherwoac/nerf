@@ -2,7 +2,7 @@ expname = lego_test
 basedir = ./logs
 datadir = ./data/nerf_synthetic/lego
 dataset_type = blender
-depth_directory = /home/adam/CODE/nerf/data/nerf_synthetic/lego/test
+# depth_directory = /home/adam/CODE/nerf/data/nerf_synthetic/lego/test
 
 
 half_res = False

@@ -645,7 +645,7 @@ def config_parser():
 
     parser.add_argument("--sigma_threshold", type=float, default=0., help='sigma_threshold')
 
-    parser.add_argument("--depth_directory", type=str, default=None, help='depth_directory')
+    parser.add_argument("--get_depth_maps", default='store_true', help='get_depth_maps')
 
     return parser
 
@@ -701,20 +701,32 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
+        images, poses, render_poses, hwf, i_split, extras = load_blender_data(
+            args.datadir, args.half_res, args.testskip, args.image_extn, mask_directory=args.mask_directory, get_depths=args.get_depth_maps)
+
         if args.mask_directory is not None:
-            images, poses, render_poses, hwf, i_split, masks = load_blender_data(
-                args.datadir, args.half_res, args.testskip, args.image_extn, mask_directory=args.mask_directory)
-        else:
-            images, poses, render_poses, hwf, i_split = load_blender_data(
-                args.datadir, args.half_res, args.testskip, args.image_extn)
+            masks = extras['masks']
+
+        if args.get_depth_maps:
+            depth_maps = extras['depth_maps']
 
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
-        Zs = poses[:, 2, 3]
-        near = np.min(Zs) * 0.9
-        far = np.max(Zs) * 1.1
+        if args.get_depth_maps and args.mask_directory is not None:
+            near = np.min(depth_maps[masks]) * 0.9
+            far = np.max(depth_maps[masks]) * 1.1
+            print('using masked depth')
+        elif args.get_depth_maps:
+            near = np.min(depth_maps) * 0.9
+            far = np.max(depth_maps) * 1.1
+        else:
+            Zs = poses[:, 2, 3]
+            near = np.min(Zs) * 0.9
+            far = np.max(Zs) * 1.1
+
+        print(f'near: {near} far: {far}')
 
         if args.white_bkgd:
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])

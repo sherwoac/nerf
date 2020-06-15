@@ -14,7 +14,8 @@ import MODELS.rotations
 import MODELS.tf_rotations
 import OUTPUT.image_tools
 import load_llff
-
+import load_blender
+from OUTPUT.image_tools import tile_images
 tf.compat.v1.enable_eager_execution()
 
 
@@ -35,16 +36,7 @@ def render_depth(args, T, H, W, focal):
     return extras_network
 
 
-def linemod_dpt(path):
-    """
-    read a depth image
 
-    @return uint16 image of distance in [mm]"""
-    dpt = open(path, "rb")
-    rows = np.frombuffer(dpt.read(4), dtype=np.int32)[0]
-    cols = np.frombuffer(dpt.read(4), dtype=np.int32)[0]
-
-    return np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols))
 
 
 def load_linemod_depth_images(base_directory, depth_directory):
@@ -54,7 +46,7 @@ def load_linemod_depth_images(base_directory, depth_directory):
         frame_number = int(re.findall(r'\d+', meta_filename)[-1])
         depth_filename = os.path.join(depth_directory, f'depth{frame_number}.dpt')
         assert os.path.isfile(depth_filename), f'mask_filename not found at: {depth_filename}'
-        actual_depth = linemod_dpt(depth_filename) / 1000
+        actual_depth = load_blender.linemod_dpt(depth_filename)
         depth_images.append(actual_depth)
 
     depth_images = np.stack(depth_images, axis=0)
@@ -73,33 +65,55 @@ def render_example(Ts):
     pcd = o3d.io.read_point_cloud('/home/adam/DATA/SH/objects/spraybottle/spraybottle-100000_centred.ply')
     coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=np.array([0., 0., 0.]))
     geoms = [coord]
-    for T in Ts:
+    for i, T in enumerate(Ts):
         print(T)
-        geoms.append(copy.deepcopy(pcd).transform(T))
+        this_bottle = copy.deepcopy(pcd)
+        this_bottle.paint_uniform_color([i / len(Ts), i / len(Ts), 0])
+        geoms.append(this_bottle.transform(T))
+        geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5, origin=np.array([0., 0., 0.])).transform(T))
 
     o3d.visualization.draw_geometries(geoms)
 
 
-if __name__ == '__main__':
-    parser = rn.config_parser()
-    args = parser.parse_args()
 
-    images, poses, render_poses, hwf, i_split, depth_maps = load_blender.load_blender_data(
-        args.datadir, args.half_res, args.testskip, args.image_extn, get_depths=True)
+def test_linemod(args):
+    images, poses, render_poses, hwf, i_split, extras = load_blender.load_blender_data(
+        args.datadir, args.half_res, args.testskip, args.image_extn, get_depths=False)
 
     print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
     i_train, i_val, i_tests = i_split
 
-    test_example = 0
-    i_test = i_tests[test_example]
+    images_drill, poses_drill, render_poses_drill, hwf_drill, i_split_drill, extras = load_blender.load_blender_data(
+        '/home/adam/shared/LINEMOD/nerf/driller', args.half_res, args.testskip, '.jpg', get_depths=True)
+
+    i_train_drill, i_val_drill, i_tests_drill = i_split_drill
+
     near = 0.
     far = 6.
     args.near = tf.cast(near, tf.float32),
     args.far = tf.cast(far, tf.float32),
 
+    for i_test, i_test_drill in zip(i_tests, i_tests_drill):
+        test_pose = poses[i_test, :4, :4]
+        plt.imshow(images[i_test,:, :, :3])
+        plt.show()
+        plt.imshow(images_drill[i_test_drill])
+        plt.show()
+        test_pose_drill = poses_drill[i_test_drill]
+        render_example([test_pose, test_pose_drill])
+
+
+if __name__ == '__main__':
+    parser = rn.config_parser()
+    args = parser.parse_args()
+    # test_linemod(args)
+    images, poses, render_poses, hwf, i_split, extras = load_blender.load_blender_data(
+        args.datadir, args.half_res, args.testskip, args.image_extn, get_depths=False)
+
+    print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
+    i_train, i_val, i_tests = i_split
+    test_pose = poses[i_tests[0]]
     H, W, focal = images[0].shape[0], images[0].shape[1], hwf[2]
-    test_pose = poses[i_test, :4, :4]
-    render_example([test_pose])
     extras = render_depth(args, test_pose, H, W, focal)
 
     rendered_depth = extras['depth_map'].numpy()
