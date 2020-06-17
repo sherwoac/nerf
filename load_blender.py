@@ -74,6 +74,7 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
 
         for frame in meta['frames'][::skip]:
             fname = os.path.join(basedir, frame['file_path'] + image_extn)
+            assert os.path.isfile(fname), f'fname not found at: {fname}'
             filenames.append(fname)
             imgs.append(imageio.imread(fname))
             poses.append(np.array(frame['transform_matrix']))
@@ -96,8 +97,9 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
 
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
 
+    extras = {}
     if mask_directory is not None:
-        masks = load_masks(basedir, mask_directory, filenames)
+        extras['masks'] = load_masks(basedir, mask_directory, filenames)
 
     imgs = np.concatenate(all_imgs, 0)
     poses = np.concatenate(all_poses, 0)
@@ -114,13 +116,10 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         W = W//2
         focal = focal/2.
 
-    extras = {}
+
     if get_depths:
         all_depth_maps = np.concatenate(all_depth_maps, 0)
         extras['depth_maps'] = np.stack(all_depth_maps, axis=0)
-
-    if mask_directory is not None:
-        extras['masks'] = masks
 
     return imgs, poses, render_poses, [H, W, focal], i_split, extras
 

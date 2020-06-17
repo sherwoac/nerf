@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import run_nerf as rn
 import run_nerf_helpers as rnh
 import load_llff # load_llff_data
+import load_blender
 import MODELS.rotations
 import MODELS.tf_rotations
 import OUTPUT.image_tools
@@ -355,6 +356,12 @@ def train_on_one_image(args, images, masks, i_test, depth_images):
     print(predicted_c2w)
     print(f'i_test: {i_test} diff: {diff[0] * 180. / np.pi:1f}deg {diff[1]:1f}')
 
+def show_depth_map(depth_map):
+    plt.imshow(depth_map)
+    plt.colorbar()
+    plt.show()
+
+
 
 def render_depth_mask(args, T, H, W, focal, depth_image, mask):
     # c2w in network
@@ -367,12 +374,25 @@ def render_depth_mask(args, T, H, W, focal, depth_image, mask):
     eye = np.eye(4, dtype=np.float32)[:3, :4]
     render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
     #render original
-    _, _, _, extras_network = rn.render(H, W, focal, c2w=eye, **render_kwargs_test)
+    rgb, _, _, extras_network = rn.render(H, W, focal, c2w=eye, **render_kwargs_test)
     print(f'near:{args.near} far: {args.far} depth near:{extras_network["depth_map"].numpy().min()} far:{extras_network["depth_map"].numpy().max()} mask depth near:{extras_network["depth_map"].numpy()[mask].min()} far:{extras_network["depth_map"].numpy()[mask].max()} loss:{rnh.img2mse(depth_image, extras_network["depth_map"])} mask loss:{rnh.img2mse(depth_image[mask], extras_network["depth_map"][mask])}')
-    plt.imshow(extras_network['depth_map'].numpy())
-    plt.colorbar()
+
+    plt.hist(extras_network['depth_map'].numpy()[mask].ravel())
+    plt.show()
+    plt.hist(depth_image[mask].ravel())
     plt.show()
 
+    show_depth_map(rgb)
+
+    show_depth_map(extras_network['depth_map'].numpy())
+    show_depth_map(depth_image)
+
+    diff_map = depth_image - extras_network['depth_map'].numpy()
+    show_depth_map(diff_map)
+    diff_map[~mask] = 0
+    show_depth_map(diff_map)
+    depth_image[~mask] = 0
+    show_depth_map(depth_image)
     near = depth_image[np.where(depth_image > 0.)].min()
     for i in range(20):
         far = near + 0.1  + i * 0.1
@@ -406,33 +426,38 @@ if __name__ == '__main__':
     # load_nerf given config
     parser = rn.config_parser()
     args = parser.parse_args()
-
-    images, poses, bds, render_poses, i_test = load_llff.load_llff_data(args.datadir, args.factor,
-                                                              recenter=True, bd_factor=.75,
-                                                              spherify=args.spherify)
-
-    if args.mask_directory is not None:
+    masks = None
+    if args.dataset_type == 'llff':
+        images, poses, bds, render_poses, i_test = load_llff.load_llff_data(args.datadir, args.factor,
+                                                                  recenter=True, bd_factor=.75,
+                                                                  spherify=args.spherify)
         masks = rn.load_masks(args.datadir, args.mask_directory)
-    else:
-        masks = None
+    elif args.dataset_type == 'blender':
+        images, poses, render_poses, hwf, i_split, extras = load_blender.load_blender_data(
+            args.datadir,
+            args.half_res,
+            args.testskip,
+            args.image_extn,
+            mask_directory=args.mask_directory,
+            get_depths=args.get_depth_maps)
 
-    if args.depth_directory is not None:
-        depth_images = load_llff.load_linemod_depth_images(args.datadir, args.depth_directory)
-    else:
-        depth_images = None
+        if args.mask_directory is not None:
+            masks = extras['masks']
+
+        if args.get_depth_maps:
+            depth_images = extras['depth_maps']
+
+    if args.Z_limits_from_pose:
+        Zs = poses[:, 2, 3]
+        near = np.min(np.abs(Zs)) * 0.9
+        far = np.max(np.abs(Zs)) * 1.2
+        args.near = tf.cast(near, tf.float32)
+        args.far = tf.cast(far, tf.float32)
 
     i_test = 2
     test_pose = poses[i_test, :3, :4]
     mask = masks[i_test]
     H, W, focal = images[0].shape[0], images[0].shape[1], 584.
-    # Create nerf model
-    # render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
-    # per step:
-    near = tf.reduce_min(bds) * .9
-    far = tf.reduce_max(bds) * 1.
-    args.near = tf.cast(near, tf.float32)
-    args.far = tf.cast(far, tf.float32)
-    print('Render kwargs:')
 
     # show_test_images_at_c2w([poses[i_test, :3, :4]], test_image, render_kwargs_test)
     # render_both_ways(args, test_pose, H, W, focal)

@@ -645,8 +645,11 @@ def config_parser():
 
     parser.add_argument("--sigma_threshold", type=float, default=0., help='sigma_threshold')
 
-    parser.add_argument("--get_depth_maps", default='store_true', help='get_depth_maps')
+    parser.add_argument("--get_depth_maps", action='store_true', help='get_depth_maps')
 
+    parser.add_argument("--Z_limits_from_pose", action='store_true', help='Z_limits_from_pose')
+
+    parser.add_argument("--force_black_background", action='store_true', help='force_black_background')
     return parser
 
 
@@ -714,25 +717,36 @@ def train():
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
-        if args.get_depth_maps and args.mask_directory is not None:
-            near = np.min(depth_maps[masks]) * 0.9
+        if args.Z_limits_from_pose:
+            Zs = poses[:, 2, 3]
+            near = np.min(np.abs(Zs)) * 0.9
+            far = np.max(np.abs(Zs)) * 1.1
+
+        elif args.get_depth_maps and args.mask_directory is not None:
+            near = np.min(np.mean(depth_maps[masks])) * 0.9
             far = np.max(depth_maps[masks]) * 1.1
             print('using masked depth')
+
         elif args.get_depth_maps:
             near = np.min(depth_maps) * 0.9
             far = np.max(depth_maps) * 1.1
+
         else:
-            Zs = poses[:, 2, 3]
-            near = np.min(Zs) * 0.9
-            far = np.max(Zs) * 1.1
+            near = 2.
+            far = 6.
 
         print(f'near: {near} far: {far}')
 
-        if args.white_bkgd:
+        if args.white_bkgd and args.mask_directory is not None:
+            images = np.concatenate([images, masks[..., np.newaxis]], axis=-1)
+            images = images[..., :3] * images[..., -1:] + (1. - images[..., -1:])
+        elif args.white_bkgd:
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
         else:
             images = images[..., :3]
-
+        # import matplotlib.pyplot as plt
+        # plt.hist(images.ravel())
+        # plt.show()
     elif args.dataset_type == 'deepvoxels':
 
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
@@ -847,7 +861,7 @@ def train():
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
 
-        if args.mask_directory:
+        if args.mask_directory and not args.white_bkgd:
             train_masks = np.stack([masks[i] for i in i_train], axis=0)
             pixel_train_masks = train_masks.ravel()
             if args.ray_masking:
@@ -939,24 +953,35 @@ def train():
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
+            loss = 0
             if args.sigma_masking:
-                img_loss = img2mse(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
+                loss += img2mse(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
             else:
-                img_loss = img2mse(rgb, target_s)
+                loss += img2mse(rgb, target_s)
+
+            if args.force_black_background:
+                loss += 0.1 * img2mse(rgb[~in_mask_pixels_batch], 0.)
+
             trans = extras['raw'][..., -1]
-            loss = img_loss
-            psnr = mse2psnr(img_loss)
+            psnr = mse2psnr(loss)
+
             if args.sigma_masking:
-                loss += 0.01 * tf.reduce_sum((~in_mask_pixels_batch) * acc) / N_rand
+                loss += 0.01 * tf.reduce_sum(acc[~in_mask_pixels_batch]) / N_rand
 
             # Add MSE loss for coarse-grained model
             if 'rgb0' in extras:
                 if args.sigma_masking:
                     img_loss0 = img2mse(extras['rgb0'][in_mask_pixels_batch], target_s[in_mask_pixels_batch])
+                    psnr0 = mse2psnr(img_loss0)
+                    loss += img_loss0 + 0.01 * tf.reduce_sum(extras['acc0'][~in_mask_pixels_batch]) / N_rand
                 else:
                     img_loss0 = img2mse(extras['rgb0'], target_s)
-                loss += img_loss0
-                psnr0 = mse2psnr(img_loss0)
+                    psnr0 = mse2psnr(img_loss0)
+                    loss += img_loss0
+
+                if args.force_black_background:
+                    loss += 0.1 * img2mse(extras['rgb0'][~in_mask_pixels_batch], 0.)
+
 
         gradients = tape.gradient(loss, grad_vars)
         optimizer.apply_gradients(zip(gradients, grad_vars))

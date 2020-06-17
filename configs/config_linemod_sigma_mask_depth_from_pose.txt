@@ -1,0 +1,21 @@
+expname = driller_linemod_sigma_mask_depth_from_pose
+basedir = ./logs
+datadir = /home/adam/shared/LINEMOD/nerf/driller
+dataset_type = blender
+
+mask_directory =  /home/adam/shared/LINEMOD/driller/mask
+mask_images = False
+ray_masking = False
+sigma_masking = True
+Z_limits_from_pose = True
+
+half_res = False
+no_ndc = True
+
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+
+N_rand = 1024
+image_extn = .jpg
