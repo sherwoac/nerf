@@ -650,6 +650,8 @@ def config_parser():
     parser.add_argument("--Z_limits_from_pose", action='store_true', help='Z_limits_from_pose')
 
     parser.add_argument("--force_black_background", action='store_true', help='force_black_background')
+
+    parser.add_argument("--visualize_optimization", action='store_true', help='visualize_optimization')
     return parser
 
 

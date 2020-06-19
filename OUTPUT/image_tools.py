@@ -40,7 +40,7 @@ def tile_images(np_array_of_arrays):
 
         new_cols = max_shape_for_this_row[1] * np_array_of_arrays.shape[1]
         new_rows = max_shape_for_this_row[0]
-        row_image = np.zeros(shape=(new_rows, new_cols, channels), dtype=np.uint8)
+        row_image = np.zeros(shape=(new_rows, new_cols, channels), dtype=np_array_of_arrays[0, 0].dtype)
         for np_col in range(np_array_of_arrays.shape[1]):
             if not np_array_of_arrays[np_row, np_col].shape[:2] == max_shape_for_this_row:
                 wrapped_image = wrap_image_to_shape(tuple([*list(max_shape_for_this_row), channels]), np_array_of_arrays[np_row, np_col])
@@ -55,7 +55,7 @@ def tile_images(np_array_of_arrays):
         if row_image.shape[0] >= max_row_shape[0] and row_image.shape[1] >= max_row_shape[1]:
             max_row_shape = row_image.shape[:2]
 
-    output_image = np.zeros(shape=(max_row_shape[0] * len(row_images), max_row_shape[1], 3), dtype=np.uint8)
+    output_image = np.zeros(shape=(max_row_shape[0] * len(row_images), max_row_shape[1], 3), dtype=np_array_of_arrays[0, 0].dtype)
     for row_number, row_image in enumerate(row_images):
         if not row_image.shape[:2] == max_row_shape:
             wrapped_image = wrap_image_to_shape(tuple([*list(max_row_shape), channels]), row_image)

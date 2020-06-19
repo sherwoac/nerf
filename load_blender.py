@@ -47,7 +47,7 @@ def linemod_dpt(path):
     rows = np.frombuffer(dpt.read(4), dtype=np.int32)[0]
     cols = np.frombuffer(dpt.read(4), dtype=np.int32)[0]
 
-    return np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols)) / 1000.
+    return (np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols)) / 1000.).astype(np.float32)
 
 
 def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None):
