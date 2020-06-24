@@ -18,7 +18,7 @@ import OUTPUT.image_tools
 tf.compat.v1.enable_eager_execution()
 
 
-def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=True, masks=None, depth_images=None):
+def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=True, masks=None, depth_images=None, K=None):
         # For random ray batching.
         #
         # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
@@ -26,10 +26,16 @@ def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=
         #   axis=0: ray origin in world space
         #   axis=1: ray direction in world space
         #   axis=2: observed RGB color of pixel
-        print('get rays')
+
         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
         # for each pixel in the image. This stack() adds a new dimension.
-        rays = [rn.get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+        if K is not None:
+            print('get rays K')
+            rays = [rn.get_rays_np_K(H, W, K, p) for p in poses[:, :3, :4]]
+        else:
+            print('get rays')
+            rays = [rn.get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+
         rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
@@ -45,7 +51,7 @@ def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=
             if masks is not None:
                 arrays_to_shuffle.append(masks.ravel())
 
-            coordinates = np.arange(depth_images.size)
+            coordinates = np.arange(images.size // 3)
             arrays_to_shuffle.append(coordinates)
 
             if depth_images is not None:
@@ -61,7 +67,7 @@ def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=
             #     return rays_rgb
             # masks, rays = rn.unison_shuffled_copies(ravelled_masks, rays_rgb)
 
-def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100, down=16, image_mask=None, test_depth_image=None):
+def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100, down=16, image_mask=None, test_depth_image=None, K=None):
     H, W, focal = test_image.shape[0]//down, test_image.shape[1]//down, 584./down
     optimizer = tf.keras.optimizers.Adam(args.lrate)
     identity_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
@@ -72,7 +78,8 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
 
     plt.imshow(test_image)
     plt.show()
-    show_depth_map(test_depth_image)
+    if test_depth_image is not None:
+        show_depth_map(test_depth_image)
 
     for epoch in range(epochs):
         ret = create_ray_batches(H, W,
@@ -84,8 +91,8 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
                                              masks=np.expand_dims(image_mask,
                                                                   axis=0) if image_mask is not None else None,
                                              depth_images=np.expand_dims(test_depth_image,
-                                                                         axis=0) if test_depth_image is not None else None
-                                             )
+                                                                         axis=0) if test_depth_image is not None else None,
+                                             K=K)
 
         rays_rgb = ret[0]
         if image_mask is not None:
@@ -124,6 +131,8 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
                     if test_depth_image is not None:
                         # print(tf.reduce_mean(extras['depth_map']), extras['depth_map'].numpy().min(), extras['depth_map'].numpy().max())
                         depth_loss = tf.reduce_mean(tf.abs(tf.gather_nd(extras['depth_map'], threshold_mask) - tf.gather_nd(depth_batch, threshold_mask)))
+                    else:
+                        depth_loss = 0.
                 else:
                     img_loss = rnh.img2mse(rgb, target_s)
 
@@ -350,7 +359,7 @@ def downsample_image(image, down):
         return image
 
 
-def train_on_one_image(args, images, masks, i_test, depth_images):
+def train_on_one_image(args, images, masks, i_test, depth_images, K):
     identity_pose = np.eye(4, dtype=np.float32)
     tf_identity_pose = tf.Variable(
         MODELS.rotations.np_transformation_matrix_to_9d_flat(
@@ -362,7 +371,7 @@ def train_on_one_image(args, images, masks, i_test, depth_images):
     elif args.dataset_type == 'blender':
         test_pose = poses[i_test]
 
-    initial_pose = MODELS.rotations.translate_Z(MODELS.rotations.rotate_about_X(test_pose, 5.).astype(np.float32), 0.0)[:3, :4]
+    initial_pose = MODELS.rotations.translate_Z(MODELS.rotations.rotate_about_X(test_pose, 0.).astype(np.float32), 0.0)[:3, :4]
     # initial_pose = identity_pose[:3, :4]
     args.c2w = tf.Variable(
         MODELS.rotations.np_transformation_matrix_to_9d_flat(
@@ -400,10 +409,11 @@ def train_on_one_image(args, images, masks, i_test, depth_images):
                                                        render_kwargs_test,
                                                        [args.c2w],
                                                        test_pose,
-                                                       epochs=99,
+                                                       epochs=10,
                                                        down=downsample,
                                                        image_mask=test_mask,
-                                                       test_depth_image=depth_image)
+                                                       test_depth_image=depth_image,
+                                                       K=K)
                                                        # ,image_mask=masks[i_test])
         downsampled_image = downsample_image(np.copy(test_image), downsample)
         args.c2w = tf_identity_pose
@@ -504,8 +514,13 @@ if __name__ == '__main__':
         if args.mask_directory is not None:
             masks = extras['masks']
 
+        depth_images = None
         if args.get_depth_maps:
             depth_images = extras['depth_maps']
+
+        K = None
+        if args.use_K:
+            K = extras['K']
 
     if args.Z_limits_from_pose:
         Zs = poses[:, 2, 3]
@@ -517,4 +532,5 @@ if __name__ == '__main__':
     # render_depth_masks(args, images, poses, depth_images, masks)
     # show_test_images_at_c2w([poses[i_test, :3, :4]], test_image, render_kwargs_test)
     # render_both_ways(args, test_pose, H, W, focal)
-    train_on_one_image(args, images, masks, i_tests[0], depth_images)
+    for i_test in i_tests:
+        train_on_one_image(args, images, masks, i_test, depth_images, K)

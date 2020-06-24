@@ -5,7 +5,7 @@ import imageio
 import json
 
 from load_llff import load_masks
-
+from create_linemod_data import linemod_camera_intrinsics
 
 
 trans_t = lambda t : tf.convert_to_tensor([
@@ -50,7 +50,7 @@ def linemod_dpt(path):
     return (np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols)) / 1000.).astype(np.float32)
 
 
-def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None):
+def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None, image_filename='file_path'):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -120,6 +120,8 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
     if get_depths:
         all_depth_maps = np.concatenate(all_depth_maps, 0)
         extras['depth_maps'] = np.stack(all_depth_maps, axis=0)
+    if 'K' in meta:
+        extras['K'] = np.array(linemod_camera_intrinsics)
 
     return imgs, poses, render_poses, [H, W, focal], i_split, extras
 

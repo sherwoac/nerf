@@ -23,8 +23,9 @@ def transform_pose(pose: np.ndarray):
 
 
 class DatasetItem(object):
-    def __init__(self, image_filename, pose:np.ndarray, camera_angle_x, depth_filename):
+    def __init__(self, image_filename, render_filename, pose:np.ndarray, camera_angle_x, depth_filename):
         self.image_filename = image_filename
+        self.render_filename = render_filename
         self.pose = np.linalg.inv(rub_to_rdf(pose))
         self.camera_angle_x = camera_angle_x
         self.depth_filename = depth_filename
@@ -32,7 +33,8 @@ class DatasetItem(object):
     def get_record(self):
         return {"file_path": f"{self.image_filename.replace('.jpg', '')}",
                 "transform_matrix": self.pose.tolist(),
-                "depth_path": f'{self.depth_filename}'}
+                "depth_path": f'{self.depth_filename}',
+                "render_filename": self.render_filename}
 
 
 def rub_to_rdf(T):
@@ -53,7 +55,7 @@ def parse_linemod_pose(path_tra, path_rot):
     return p
 
 
-def get_records(list_of_ids: list, image_dir, label_dir):
+def get_records(list_of_ids: list, image_dir, label_dir, render_dir):
     def get_camera_angle_x():
         example_image_filename = os.path.join(image_dir, f'color{list_of_ids[0]}.jpg')
         example_image = iio.imread(example_image_filename)
@@ -66,11 +68,12 @@ def get_records(list_of_ids: list, image_dir, label_dir):
     dataset_records = []
     for id in list_of_ids:
         image_filename = os.path.join(image_dir, f'color{id}.jpg')
+        render_image_filename = os.path.join(render_dir, f'render_{str(id).zfill(4)}.png')
         translation_filename = os.path.join(label_dir, f'tra{id}.tra')
         rotation_filename = os.path.join(label_dir, f'rot{id}.rot')
         depth_filename = os.path.join(label_dir, f'depth{id}.dpt')
         T = parse_linemod_pose(translation_filename, rotation_filename)
-        dataset_records.append(DatasetItem(image_filename, T, camera_angle_x, depth_filename))
+        dataset_records.append(DatasetItem(image_filename, render_image_filename, T, camera_angle_x, depth_filename))
 
     return dataset_records, camera_angle_x, linemod_camera_intrinsics[0, 0]
 
@@ -112,6 +115,7 @@ def get_datasets_ape_in_corner(linemod_dataset_dir: str, class_name: str):
 class LinemodLoader(object):
     linemod_orig_dir = '/home/adam/shared/LINEMOD_ORIG'
     linemod_dataset_dir = '/home/adam/shared/LINEMOD'
+    render_sub_dir = os.path.join(linemod_dataset_dir, 'renders_linemod')
     linemod_objects = ['driller']
     dataset_names = ['train', 'test', 'val', 'all']
     down_sample_mini = 5
@@ -125,6 +129,7 @@ class LinemodLoader(object):
             for test_train_dataset_name in LinemodLoader.dataset_names:
                 image_dir = os.path.join(LinemodLoader.linemod_orig_dir, object_name, 'data')
                 label_dir = image_dir
+                render_dir = os.path.join(LinemodLoader.render_sub_dir, object_name)
                 if test_train_dataset_name in ['test', 'train']:
                     ids = dataset_ids[test_train_dataset_name]
                 elif test_train_dataset_name == 'val':
@@ -132,9 +137,10 @@ class LinemodLoader(object):
                 elif test_train_dataset_name == 'all':
                     ids = list(sorted([item for sublist in dataset_ids.values() for item in sublist]))
 
-                dataset_records, camera_angle_x, _ = get_records(ids, image_dir, label_dir)
+                dataset_records, camera_angle_x, _ = get_records(ids, image_dir, label_dir, render_dir)
                 json_dataset = {}
                 json_dataset['camera_angle_x'] = camera_angle_x
+                json_dataset['K'] = linemod_camera_intrinsics.tolist()
                 json_dataset['frames'] = [dataset_record.get_record() for dataset_record in dataset_records]
                 if not os.path.isdir(obj_output_directory):
                     os.mkdir(obj_output_directory)
@@ -160,13 +166,9 @@ class LinemodLoader(object):
                     ids = list(sorted([item for sublist in dataset_ids.values() for item in sublist]))
 
                 dataset_records, camera_angle_x, focal_length = get_records(ids, image_dir, label_dir)
-
-                # images = data['images']
-                # poses = data['poses']
-                # focal = data['focal']
                 images = []
                 poses = []
-                for dataset_record in dataset_records[:number_of_records]:
+                for dataset_record in dataset_records:
                     images.append(iio.imread(dataset_record.image_filename))
                     poses.append(dataset_record.pose)
 
@@ -176,6 +178,40 @@ class LinemodLoader(object):
             output_mini_filename = os.path.join(obj_output_directory, f'mini_{object_name}.npz')
             np.savez(output_mini_filename, **{'images': resized_images.numpy().astype(np.float32), 'poses': np.stack(poses, axis=0).astype(np.float32), 'focal': focal_length / self.down_sample_mini})
             print(f'written: {output_mini_filename} len: {len(images)}')
+
+    def make_mini_all(self):
+        for object_name in LinemodLoader.linemod_objects:
+            obj_output_directory = os.path.join(self.output_directory, object_name)
+            dataset_ids = get_datasets(LinemodLoader.linemod_dataset_dir, object_name)
+
+            image_filenames = []
+            poses = []
+            dataset_names = []
+
+            for test_train_dataset_name in ['test', 'train']:
+                image_dir = os.path.join(LinemodLoader.linemod_orig_dir, object_name, 'data')
+                label_dir = image_dir
+                if test_train_dataset_name in ['test', 'train']:
+                    ids = dataset_ids[test_train_dataset_name]
+                elif test_train_dataset_name == 'val':
+                    ids = dataset_ids['test']
+                elif test_train_dataset_name == 'all':
+                    ids = list(sorted([item for sublist in dataset_ids.values() for item in sublist]))
+
+                dataset_records, camera_angle_x, focal_length = get_records(ids, image_dir, label_dir)
+
+                for dataset_record in dataset_records:
+                    image_filenames.append(dataset_record.image_filename)
+                    poses.append(dataset_record.pose)
+                    dataset_names.append(test_train_dataset_name)
+
+            output_mini_filename = os.path.join(obj_output_directory, f'simple_{object_name}.npz')
+            np.savez(output_mini_filename, **{'image_filenames': image_filenames,
+                                              'poses': np.stack(poses, axis=0).astype(np.float32),
+                                              'dataset_names': dataset_names,
+                                              'intrinsics': linemod_camera_intrinsics})
+            print(f'written: {output_mini_filename} len: {len(image_filenames)}')
+
 
     @staticmethod
     def load_jsons(obj_output_directory):
@@ -202,4 +238,5 @@ if __name__ == '__main__':
     tf.compat.v1.enable_eager_execution()
     lml = LinemodLoader()
     lml.make_jsons()
-    lml.make_mini(102)
+    # lml.make_mini(102)
+    # lml.make_mini_all()

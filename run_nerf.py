@@ -652,6 +652,10 @@ def config_parser():
     parser.add_argument("--force_black_background", action='store_true', help='force_black_background')
 
     parser.add_argument("--visualize_optimization", action='store_true', help='visualize_optimization')
+
+    parser.add_argument("--use_K", action='store_true', help='use_K - full camera model')
+
+    parser.add_argument("--image_filename", type=str, default='file_path', help='image_filename')
     return parser
 
 
@@ -707,13 +711,16 @@ def train():
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split, extras = load_blender_data(
-            args.datadir, args.half_res, args.testskip, args.image_extn, mask_directory=args.mask_directory, get_depths=args.get_depth_maps)
+            args.datadir, args.half_res, args.testskip, args.image_extn, mask_directory=args.mask_directory, get_depths=args.get_depth_maps, image_filename=args.image_filename)
 
         if args.mask_directory is not None:
             masks = extras['masks']
 
         if args.get_depth_maps:
             depth_maps = extras['depth_maps']
+
+        if args.use_K:
+            K = extras['K']
 
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
@@ -851,10 +858,16 @@ def train():
         #   axis=0: ray origin in world space
         #   axis=1: ray direction in world space
         #   axis=2: observed RGB color of pixel
-        print('get rays')
+
         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
         # for each pixel in the image. This stack() adds a new dimension.
-        rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+        if args.use_K:
+            print('get rays K')
+            rays = [get_rays_np_K(H, W, K, p) for p in poses[:, :3, :4]]
+        else:
+            print('get rays')
+            rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+
         rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
@@ -923,7 +936,10 @@ def train():
             pose = poses[img_i, :3, :4]
 
             if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, focal, pose)
+                if args.use_K:
+                    rays_o, rays_d = get_rays_K(H, W, K, pose)
+                else:
+                    rays_o, rays_d = get_rays(H, W, focal, pose)
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
                     dW = int(W//2 * args.precrop_frac)
