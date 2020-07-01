@@ -2,9 +2,10 @@ import os, sys
 import pprint
 import tensorflow as tf
 import numpy as np
+import scipy
 import imageio
 import pprint
-
+import re
 import matplotlib.pyplot as plt
 
 import run_nerf as rn
@@ -14,6 +15,8 @@ import load_blender
 import MODELS.rotations
 import MODELS.tf_rotations
 import OUTPUT.image_tools
+import LOADER.dumb_loader as dl
+import create_linemod_data
 
 tf.compat.v1.enable_eager_execution()
 
@@ -67,7 +70,73 @@ def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=
             #     return rays_rgb
             # masks, rays = rn.unison_shuffled_copies(ravelled_masks, rays_rgb)
 
-def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100, down=16, image_mask=None, test_depth_image=None, K=None):
+
+def create_masked_ray_batches(H, W, focal, ray_mask, images, poses, i_train=[0], seed=0, shuffle=True, masks=None, depth_images=None,
+                       K=None):
+    # For random ray batching.
+    #
+    # Constructs an array 'rays_rgb' of shape [N*H*W, 3, 3] where axis=1 is
+    # interpreted as,
+    #   axis=0: ray origin in world space
+    #   axis=1: ray direction in world space
+    #   axis=2: observed RGB color of pixel
+
+    # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
+    # for each pixel in the image. This stack() adds a new dimension.
+    if K is not None:
+        print('get rays K')
+        rays = [rn.get_rays_np_K(H, W, K, p) for p in poses[:, :3, :4]]
+    else:
+        print('get rays')
+        rays = [rn.get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
+
+    rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
+    print('done, concats')
+    # [N, ro+rd+rgb, H, W, 3]
+    rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
+    # [N, H, W, ro+rd+rgb, 3]
+    rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
+    rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
+    # [(N-1)*H*W, ro+rd+rgb, 3]
+    rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
+    rays_rgb = rays_rgb.astype(np.float32)
+    if shuffle:
+        arrays_to_shuffle = [rays_rgb]
+        if masks is not None:
+            arrays_to_shuffle.append(masks.ravel())
+
+        coordinates = np.arange(images.size // 3)
+        arrays_to_shuffle.append(coordinates)
+
+        if depth_images is not None:
+            arrays_to_shuffle.append(depth_images.ravel())
+
+        shuffled_arrays = rn.unison_shuffled_copies(arrays_to_shuffle)
+        return tuple(shuffled_arrays)
+        # return masks, rays
+        # else:
+        #     print('shuffle rays')
+        #     np.random.RandomState(seed).shuffle(rays_rgb)
+        #     print('done')
+        #     return rays_rgb
+        # masks, rays = rn.unison_shuffled_copies(ravelled_masks, rays_rgb)
+
+
+def find_rough_mask(args, render_kwargs, test_image, down, K):
+    H, W = test_image.shape[:2]
+    H_down, W_down, K_down = test_image.shape[0] // down, test_image.shape[1] // down, K / down
+    rays = rn.get_rays_np_K(H_down, W_down, K_down, c2w=np.eye(4, dtype=np.float32)[:3, :4])
+    _, _, acc, _ = rn.render(H_down, W_down, focal=-1.0, rays=rays, **render_kwargs)
+    threshold_full_mask = tf.where(acc > args.sigma_threshold,
+                                   tf.ones(shape=acc.shape[:2]),
+                                   tf.zeros(shape=acc.shape[:2]))
+
+    dilated_threshold_mask = scipy.ndimage.binary_dilation(threshold_full_mask.numpy()).astype(threshold_full_mask.numpy().dtype)
+    resized_threshold_mask = np.squeeze(tf.image.resize(np.expand_dims(dilated_threshold_mask, axis=-1), (H, W)).numpy())
+    return np.where(resized_threshold_mask.astype(np.bool).ravel())
+
+
+def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100, down=1, image_mask=None, test_depth_image=None, K=None):
     H, W, focal = test_image.shape[0]//down, test_image.shape[1]//down, 584./down
     optimizer = tf.keras.optimizers.Adam(args.lrate)
     identity_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
@@ -76,44 +145,51 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
     translation_difference = []
     downsampled_image = downsample_image(np.copy(test_image), down)
 
-    plt.imshow(test_image)
-    plt.show()
     if test_depth_image is not None:
         show_depth_map(test_depth_image)
 
+    loss_min = (float("inf"), )
+    img_loss_min = (float("inf"), )
+    depth_loss_min = (float("inf"), )
+
     for epoch in range(epochs):
-        ret = create_ray_batches(H, W,
-                                             focal,
-                                             np.expand_dims(downsampled_image, axis=0),
-                                             np.expand_dims(identity_transformation, axis=0),
-                                             seed=epoch,
-                                             shuffle=True,
-                                             masks=np.expand_dims(image_mask,
-                                                                  axis=0) if image_mask is not None else None,
-                                             depth_images=np.expand_dims(test_depth_image,
-                                                                         axis=0) if test_depth_image is not None else None,
-                                             K=K)
+
+        up_mask = find_rough_mask(args, render_kwargs, test_image, 16, K)
+
+        ret = create_ray_batches(H,
+                                 W,
+                                 focal,
+                                 np.expand_dims(downsampled_image, axis=0),
+                                 np.expand_dims(identity_transformation, axis=0),
+                                 seed=epoch,
+                                 shuffle=True,
+                                 masks=np.expand_dims(image_mask, axis=0) if image_mask is not None else None,
+                                 depth_images=np.expand_dims(test_depth_image, axis=0) if test_depth_image is not None else None,
+                                 K=K)
 
         rays_rgb = ret[0]
+        rays_rgb = rays_rgb[up_mask]
         if image_mask is not None:
             masks = ret[1]
+            masks = masks[up_mask]
 
         if test_depth_image is not None:
             depths = ret[-1]
+            depths = depths[up_mask]
 
-        shuffled_coordinates = ret[-2]
+        # shuffled_coordinates = ret[-2]
 
         number_of_batches = max(rays_rgb.shape[0] // args.N_rand, 1)
         for i_batch in range(number_of_batches):
             with tf.GradientTape() as tape:
                 # Random over all image
-                batch_indicies = slice(i_batch * args.N_rand, i_batch * args.N_rand+args.N_rand)
-                batch = rays_rgb[batch_indicies] # [B, 2+1, 3*?]
+                batch_indices = slice(i_batch * args.N_rand, i_batch * args.N_rand + args.N_rand)
+                batch = rays_rgb[batch_indices] # [B, 2+1, 3*?]
                 if image_mask is not None:
-                    mask_batch = masks[batch_indicies]  # [B, 2+1, 3*?]
+                    mask_batch = masks[batch_indices]  # [B, 2+1, 3*?]
 
                 if test_depth_image is not None:
-                    depth_batch = depths[batch_indicies]  # [B, 2+1, 3*?]
+                    depth_batch = depths[batch_indices]  # [B, 2+1, 3*?]
 
                 batch = tf.transpose(batch, [1, 0, 2])
                 # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
@@ -137,7 +213,7 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
                     img_loss = rnh.img2mse(rgb, target_s)
 
                 trans = extras['raw'][..., -1]
-                loss = img_loss + depth_loss
+                loss = img_loss + 100.*depth_loss
                 # psnr = rnh.mse2psnr(img_loss)
 
                 # Add MSE loss for coarse-grained model
@@ -158,39 +234,23 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
             translation_difference.append(diff[1])
 
             print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss:1f} depth loss: {depth_loss:1f} diff: {diff[0] * 180. / np.pi:1f}deg {diff[1]:1f}m')
+            if loss.numpy() < loss_min[0]:
+                loss_min = (loss.numpy(), diff[0], diff[1])
+
+            if img_loss.numpy() < img_loss_min[0]:
+                img_loss_min = (img_loss.numpy(), diff[0], diff[1])
+
+            if depth_loss.numpy() < depth_loss_min[0]:
+                depth_loss_min = (depth_loss.numpy(), diff[0], diff[1])
+
             if args.visualize_optimization:
-                rgb, disp, acc, extras = rn.render(H, W, focal, c2w=identity_transformation, retraw=True, **render_kwargs)
-                tf.reduce_max(rgb)
-                threshold_full_mask = tf.where(acc > args.sigma_threshold, tf.ones(shape=rgb.shape[:2]), tf.zeros(shape=rgb.shape[:2]))
-                rgb_thresholded = (rgb * threshold_full_mask[:, :, tf.newaxis]).numpy()
-                depth_thresholded = threshold_full_mask * extras['depth_map']
-                depth3 = get_array_norm(extras['depth_map'].numpy())
-                depth_th3 = depth_thresholded.numpy()
-                thresholded_gt_depth = threshold_full_mask * test_depth_image
-                overlap = np.concatenate([threshold_full_mask.numpy()[:, :, np.newaxis],
-                                          image_mask.astype(np.float32)[:, :, np.newaxis],
-                                np.zeros(shape=threshold_full_mask.shape[:2]+[1])], axis=-1)
-                batch_shuffle_mask = np.zeros(shape=test_image.shape[:2]).astype(np.bool)
-                in_object_batch_shuffle_mask = np.zeros(shape=test_image.shape[:2]).astype(np.bool)
-                batch_shuffle_mask.ravel()[shuffled_coordinates[batch_indicies]] = True
-                in_object_batch_shuffle_mask.ravel()[shuffled_coordinates[batch_indicies][threshold_mask]] = True
-                # show_batch_image = np.copy(rgb.numpy())
-                # show_batch_image[batch_shuffle_mask] = 1
-                test_depth_image_norm = get_mpl_array_plot(get_array_norm(test_depth_image))
-                test_depth_image_norm[threshold_full_mask.numpy().astype(np.bool)] = np.array([1., 0., 0.])
-
-                test_image_output = np.copy(test_image)
-                test_image_output[batch_shuffle_mask] = np.array([1., 0., 0.])
-                test_image_output[in_object_batch_shuffle_mask] = np.array([0., 1., 0.])
-
-                rgb_thresholded[batch_shuffle_mask] = np.array([1., 0., 0.])
-                rgb_thresholded[in_object_batch_shuffle_mask] = np.array([0., 1., 0.])
-                tiled = OUTPUT.image_tools.tile_images(
-                    np.array(
-                            [[make_rgb(acc), test_image_output, get_mpl_array_plot(depth3), test_depth_image_norm],
-                             [overlap, rgb_thresholded, get_mpl_array_plot(depth_th3), get_mpl_array_plot(depth_thresholded - thresholded_gt_depth)]]
-                    ),
-                )
+                tiled = output_interim_results(test_image,
+                                               render_kwargs,
+                                               test_depth_image,
+                                               image_mask,
+                                               shuffled_coordinates,
+                                               batch_indices,
+                                               threshold_mask)
                 imageio.imwrite(f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{str(epoch * 100 + i_batch).zfill(4)}.png', (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
 
     plt.plot(loss_list, label='loss')
@@ -198,7 +258,47 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
     plt.plot(translation_difference, label='translation_difference')
     plt.legend()
     plt.show()
-    return T
+    results = {'loss_min':loss_min, 'img_loss_min':img_loss_min, 'depth_loss_min':depth_loss_min}
+
+    return T, results
+
+
+def output_interim_results(test_image, render_kwargs, test_depth_image, image_mask, shuffled_coordinates, batch_indices, threshold_mask):
+    H, W =test_image.shape[:2]
+    rgb, disp, acc, extras = rn.render(H, W, 1.0, c2w=np.eye(4, dtype=np.float32)[:3, :4], **render_kwargs)
+    threshold_full_mask = tf.where(acc > args.sigma_threshold, tf.ones(shape=rgb.shape[:2]),
+                                   tf.zeros(shape=rgb.shape[:2]))
+    rgb_thresholded = (rgb * threshold_full_mask[:, :, tf.newaxis]).numpy()
+    depth_thresholded = threshold_full_mask * extras['depth_map']
+    depth3 = get_array_norm(extras['depth_map'].numpy())
+    depth_th3 = depth_thresholded.numpy()
+    thresholded_gt_depth = threshold_full_mask * test_depth_image
+    overlap = np.concatenate([threshold_full_mask.numpy()[:, :, np.newaxis],
+                              image_mask.astype(np.float32)[:, :, np.newaxis],
+                              np.zeros(shape=threshold_full_mask.shape[:2] + [1])], axis=-1)
+    batch_shuffle_mask = np.zeros(shape=test_image.shape[:2]).astype(np.bool)
+    in_object_batch_shuffle_mask = np.zeros(shape=test_image.shape[:2]).astype(np.bool)
+    batch_shuffle_mask.ravel()[shuffled_coordinates[batch_indices]] = True
+    in_object_batch_shuffle_mask.ravel()[shuffled_coordinates[batch_indices][threshold_mask]] = True
+    # show_batch_image = np.copy(rgb.numpy())
+    # show_batch_image[batch_shuffle_mask] = 1
+    test_depth_image_norm = get_mpl_array_plot(get_array_norm(test_depth_image))
+    test_depth_image_norm[threshold_full_mask.numpy().astype(np.bool)] = np.array([1., 0., 0.])
+
+    test_image_output = np.copy(test_image)
+    test_image_output[batch_shuffle_mask] = np.array([1., 0., 0.])
+    test_image_output[in_object_batch_shuffle_mask] = np.array([0., 1., 0.])
+
+    rgb_thresholded[batch_shuffle_mask] = np.array([1., 0., 0.])
+    rgb_thresholded[in_object_batch_shuffle_mask] = np.array([0., 1., 0.])
+    tiled = OUTPUT.image_tools.tile_images(
+        np.array(
+            [[make_rgb(acc), test_image_output, get_mpl_array_plot(depth3), test_depth_image_norm],
+             [overlap, rgb_thresholded, get_mpl_array_plot(depth_th3),
+              get_mpl_array_plot(depth_thresholded - thresholded_gt_depth)]]
+        ),
+    )
+    return tiled
 
 
 def get_array_norm(array):
@@ -220,11 +320,12 @@ def get_mpl_array_plot(array):
     image = (np.frombuffer(canvas.tostring_rgb(), dtype='uint8').reshape(int(height), int(width), 3) / 255.).astype(np.float32)
     return image
 
+
 def make_rgb(single_channel_image):
     return np.concatenate([single_channel_image[:, :, np.newaxis], single_channel_image[:, :, np.newaxis], single_channel_image[:, :, np.newaxis]], axis=-1)
 
 
-def render_both_ways(args, T, H, W, focal):
+def render_both_ways(args, T, H, W, K):
     # c2w in rays
     render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
 
@@ -233,9 +334,10 @@ def render_both_ways(args, T, H, W, focal):
         'far': args.far,
     }
     render_kwargs_test.update(bds_dict)
+    down = 16
+    render_kwargs_test.update({'K': K / down})
 
-    down = 8
-    c2w_first_rgb, _, _, _ = rn.render(H // down, W // down, focal // down, c2w=T, **render_kwargs_test)
+    c2w_first_rgb, _, _, _ = rn.render(H // down, W // down, 1.0 // down, c2w=T, **render_kwargs_test)
 
     # c2w in network
     args.c2w = tf.Variable(
@@ -244,17 +346,17 @@ def render_both_ways(args, T, H, W, focal):
                 ),
                 name='c2w')
 
-    eye = np.eye(4, dtype=np.float32)[:3, :4]
+    identity_transformation = np.eye(4, dtype=np.float32)[:3, :4]
     render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
     bds_dict = {
         'near': args.near,
         'far': args.far,
     }
     render_kwargs_test.update(bds_dict)
+    render_kwargs_test.update({'K': K / down})
+    c2w_network_rgb, _, _, _ = rn.render(H // down, W // down, 1.0 // down, c2w=identity_transformation, **render_kwargs_test)
 
-    c2w_network_rgb, _, _, _ = rn.render(H // down, W // down, focal // down, c2w=eye, **render_kwargs_test)
-
-    tiled_images = OUTPUT.image_tools.tile_images(np.clip(np.array([[255.*np.clip(c2w_first_rgb.numpy(), 0, 1), 255.*np.clip(c2w_network_rgb.numpy(), 0, 1)]]), 0., 1.))
+    tiled_images = OUTPUT.image_tools.tile_images(np.clip(np.array([[255.*np.clip(c2w_first_rgb.numpy(), 0., 1.), 255.*np.clip(c2w_network_rgb.numpy(), 0., 1.)]]), 0., 1.))
     # tiled_images = OUTPUT.image_tools.tile_images(
     #     np.array([[255. * c2w_first_rgb.numpy(), 255. * c2w_network_rgb.numpy()]]))
     plt.imshow(tiled_images)
@@ -359,20 +461,53 @@ def downsample_image(image, down):
         return image
 
 
-def train_on_one_image(args, images, masks, i_test, depth_images, K):
-    identity_pose = np.eye(4, dtype=np.float32)
-    tf_identity_pose = tf.Variable(
-        MODELS.rotations.np_transformation_matrix_to_9d_flat(
-            np.expand_dims(identity_pose, axis=0)
-        ),
-        name='c2w')
-    if args.dataset_type == 'llff':
-        test_pose = np.r_[poses[i_test][:, :4], [[0., 0., 0., 1.]]].astype(np.float32)
-    elif args.dataset_type == 'blender':
-        test_pose = poses[i_test]
+def test_perturbation_range(args, images, poses, depth_images, K):
+    for test_pose in poses:
+        for x_deg in [0., 1., 2., 4., 8.]:
+            for z_offset in [-8, -4, -2, 0., 2, 4, 8]:
+                z = z_offset / 100.
+                initial_pose = MODELS.rotations.translate_Z(MODELS.rotations.rotate_about_X(test_pose, x_deg).astype(np.float32), z)[:3, :4]
+                # initial_pose = identity_pose[:3, :4]
+                args.c2w = tf.Variable(
+                    MODELS.rotations.np_transformation_matrix_to_9d_flat(
+                        np.expand_dims(initial_pose, axis=0)
+                    ),
+                    name='c2w')
+                # Create nerf model
+                render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
+                # per step:
+                test_image = images[i_test]
+                test_mask = masks[i_test]
+                # test_image = images[i_test]
+                if depth_images is not None:
+                    depth_image = depth_images[i_test]
+                    depth_image = np.where(depth_image == 0., args.far.numpy(), depth_image)
+                else:
+                    depth_image = None
 
-    initial_pose = MODELS.rotations.translate_Z(MODELS.rotations.rotate_about_X(test_pose, 0.).astype(np.float32), 0.0)[:3, :4]
-    # initial_pose = identity_pose[:3, :4]
+                bds_dict = {
+                    'near': args.near,
+                    'far': args.far
+                }
+
+                render_kwargs_test.update(bds_dict)
+
+                pprint.pprint(render_kwargs_test)
+                # print(f'diff: {MODELS.rotations.compare_rotations(test_pose, initial_pose) * 180. / np.pi:.2f}deg')
+                for downsample in [1]:
+                    predicted_c2w, results = optimize_model_to_single_image(args,
+                                                                   test_image,
+                                                                   render_kwargs_test,
+                                                                   [args.c2w],
+                                                                   test_pose,
+                                                                   epochs=10,
+                                                                   down=downsample,
+                                                                   image_mask=test_mask,
+                                                                   test_depth_image=depth_image,
+                                                                   K=K)
+
+
+def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, test_depth_image, K):
     args.c2w = tf.Variable(
         MODELS.rotations.np_transformation_matrix_to_9d_flat(
             np.expand_dims(initial_pose, axis=0)
@@ -380,70 +515,73 @@ def train_on_one_image(args, images, masks, i_test, depth_images, K):
         name='c2w')
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, _, models = rn.create_nerf(args)
-    # per step:
-    test_image = images[i_test]
-    test_mask = masks[i_test]
-    # test_image = images[i_test]
-    if depth_images is not None:
-        depth_image = depth_images[i_test]
-        depth_image = np.where(depth_image == 0., args.far.numpy(), depth_image)
-    else:
-        depth_image = None
-
-    # bds_dict = {
-    #     'near': args.near,
-    #     'far': args.far
-    # }
     bds_dict = {
         'near': args.near,
         'far': args.far
     }
 
     render_kwargs_test.update(bds_dict)
-
     pprint.pprint(render_kwargs_test)
-    # print(f'diff: {MODELS.rotations.compare_rotations(test_pose, initial_pose) * 180. / np.pi:.2f}deg')
-    for downsample in [1]:
-        predicted_c2w = optimize_model_to_single_image(args,
-                                                       test_image,
-                                                       render_kwargs_test,
-                                                       [args.c2w],
-                                                       test_pose,
-                                                       epochs=10,
-                                                       down=downsample,
-                                                       image_mask=test_mask,
-                                                       test_depth_image=depth_image,
-                                                       K=K)
-                                                       # ,image_mask=masks[i_test])
-        downsampled_image = downsample_image(np.copy(test_image), downsample)
-        args.c2w = tf_identity_pose
-        show_test_images_at_c2w([initial_pose, test_pose, predicted_c2w],
-                                downsampled_image,
-                                render_kwargs_test,
-                                titles=[f'downsample:{downsample}', 'test_image', 'initial_pose', 'test_pose', 'predicted_pose'])
+    predicted_c2w, results = optimize_model_to_single_image(args,
+                                                   test_image,
+                                                   render_kwargs_test,
+                                                   [args.c2w],
+                                                   test_pose,
+                                                   epochs=10,
+                                                   image_mask=test_mask,
+                                                   test_depth_image=test_depth_image,
+                                                   K=K)
 
-        args.c2w = tf.Variable(
-            MODELS.rotations.np_transformation_matrix_to_9d_flat(
-                np.expand_dims(predicted_c2w, axis=0)
-            ),
-            name='c2w')
+    return predicted_c2w
 
-    args.c2w = tf_identity_pose
-    show_test_images_at_c2w([initial_pose, test_pose, predicted_c2w],
-                            test_image,
-                            render_kwargs_test,
-                            titles=[f'i_test:{i_test}', 'test_image', 'initial_pose', 'test_pose', 'predicted_pose'])
-
-    diff = MODELS.rotations.compare_poses(test_pose, predicted_c2w)
-    print(test_pose)
-    print(predicted_c2w)
-    print(f'i_test: {i_test} diff: {diff[0] * 180. / np.pi:1f}deg {diff[1]:1f}')
 
 def show_depth_map(depth_map):
     plt.imshow(depth_map)
     plt.colorbar()
     plt.show()
 
+
+def loss_plot(values, which_loss, measure_name, x_ticks, y_ticks, x_axis_label, y_axis_label):
+    fig, ax = plt.subplots(1, 1)
+    from matplotlib.pylab import cm
+    from matplotlib.colors import LogNorm
+    plt.title(f'loss: {which_loss} measure_name: {measure_name}')
+    # img = ax.imshow(values)
+    img = ax.matshow(values, cmap=cm.gray_r, norm=LogNorm(vmin=0.01, vmax=1))
+    ax.set_xticks(np.arange(len(x_ticks)))
+    ax.set_xticklabels([str(x_tick) for x_tick in x_ticks])
+    ax.set_xlabel(x_axis_label)
+    ax.set_yticks(np.arange(len(y_ticks)))
+    ax.set_yticklabels([str(y_tick) for y_tick in y_ticks])
+    ax.set_ylabel(y_axis_label)
+    fig.colorbar(img)
+    plt.show()
+
+
+def plot_results():
+    import pickle
+    assert os.path.isfile('overall_results.pkl'), f'file not found at: {"overall_results.pkl"}'
+    input = open('overall_results.pkl', 'rb')
+    overall_results = pickle.load(input)
+
+    factor = 180. / np.pi
+
+    x_degs = [0., 1., 2., 4., 8.]
+    zs = [-8., -4., -2., 0., 2., 4., 8.]
+    for i, measure in enumerate(['val', 'angle', 'translation']):
+        loss_mins = np.zeros(shape=(len(x_degs), len(zs)))
+        img_loss_mins = np.zeros_like(loss_mins)
+        depth_loss_mins = np.zeros_like(loss_mins)
+        for key, value in overall_results.items():
+            x_deg, z = key
+            z *= 100.
+            loss_mins[x_degs.index(x_deg), zs.index(z)] = value['loss_min'][i] * (factor if measure == 'angle' else 1.)
+            img_loss_mins[x_degs.index(x_deg), zs.index(z)] = value['img_loss_min'][i] * (factor if measure == 'angle' else 1.)
+            depth_loss_mins[x_degs.index(x_deg), zs.index(z)] = value['depth_loss_min'][i] * (factor if measure == 'angle' else 1.)
+
+        loss_plot(loss_mins, 'overall', measure, zs, x_degs, 'z displacement (m)', 'x rotation (deg)')
+        loss_plot(img_loss_mins, 'image', measure, zs, x_degs, 'z displacement (m)', 'x rotation (deg)')
+        loss_plot(depth_loss_mins, 'depth', measure, zs, x_degs, 'z displacement (m)', 'x rotation (deg)')
 
 
 def render_depth_mask(args, T, H, W, focal, depth_image, mask):
@@ -489,6 +627,17 @@ def render_depth_masks(args, images, poses, depth_images, masks):
         render_depth_mask(args, poses[i_test, :3, :4], H, W, focal, depth_images[i_test], masks[i_test])
 
 
+def load_approximate_poses(approximate_poses_filename):
+    assert os.path.isfile(approximate_poses_filename), \
+        f'approximate_poses_filename not found at: {approximate_poses_filename}'
+    df = dl.open_dataframe(approximate_poses_filename)
+    return {int(df_row['frame_number']):
+        create_linemod_data.rub_to_rdf(
+            df_row['revised_pose'].astype(np.float32)
+
+    ) for _, df_row in df.iterrows()}
+
+
 if __name__ == '__main__':
     # try_render_demo()
     # load_nerf given config
@@ -529,8 +678,33 @@ if __name__ == '__main__':
         args.near = tf.cast(near, tf.float32)
         args.far = tf.cast(far, tf.float32)
 
+    test_pose = poses[i_tests[0]]
+    H, W = images[0].shape[:2]
     # render_depth_masks(args, images, poses, depth_images, masks)
     # show_test_images_at_c2w([poses[i_test, :3, :4]], test_image, render_kwargs_test)
-    # render_both_ways(args, test_pose, H, W, focal)
-    for i_test in i_tests:
-        train_on_one_image(args, images, masks, i_test, depth_images, K)
+    # render_both_ways(args, test_pose, H, W, extras['K'])
+    if args.approximate_poses_filename:
+        approximate_pose_dict = load_approximate_poses(args.approximate_poses_filename)
+
+    overall_results = {}
+    predicted_poses = []
+    for i, i_test in enumerate(i_tests):
+        filename = extras['filenames'][2][i]
+        frame_number = int(re.findall(r'\d+', filename)[-1])
+        test_image = images[i_test]
+        test_mask = masks[i]
+        test_depth_image = depth_images[i_test]
+        initial_pose = approximate_pose_dict[frame_number]
+        print(filename, MODELS.rotations.compare_poses(initial_pose, test_pose))
+        # predicted_c2w = train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, test_depth_image, K)
+        # predicted_poses.append(predicted_c2w)
+        # overall_results[i_test] = predicted_c2w
+        # diff_refined = MODELS.rotations.compare_poses(initial_pose, predicted_c2w)
+        # diff_test = MODELS.rotations.compare_poses(test_pose, predicted_c2w)
+        # print(f'i_test: {i_test} diff refined: {diff_refined[0] * 180. / np.pi:1f}deg {diff_refined[1]:1f}m {diff_test[0]} {diff_test[0]}')
+
+    import pickle
+    output = open('overall_results.pkl', 'wb')
+    pickle.dump(overall_results, output)
+    output.close()
+    plot_results()

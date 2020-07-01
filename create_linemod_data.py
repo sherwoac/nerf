@@ -4,7 +4,7 @@ import numpy as np
 import imageio as iio
 import tensorflow as tf
 
-linemod_camera_intrinsics = np.array([[572.4114, 0., 325.2611], [0., 573.57043, 242.04899], [0., 0., 1.]])
+linemod_camera_intrinsics = np.array([[572.4114, 0., 325.2611], [0., 573.57043, 242.04899], [0., 0., 1.]]).astype(np.float32)
 
 
 def camera_angle_x_to_focal(camera_angle_x, W):

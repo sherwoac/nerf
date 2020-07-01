@@ -61,19 +61,24 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
     all_poses = []
     all_depth_maps = []
     counts = [0]
-    filenames = []
+    all_filenames = []
     for s in splits:
         meta = metas[s]
         imgs = []
         poses = []
         depth_maps = []
-        if s=='train' or testskip==0:
+        if s == 'train' or testskip == 0:
             skip = 1
         else:
             skip = testskip
-
+        filenames = []
         for frame in meta['frames'][::skip]:
-            fname = os.path.join(basedir, frame['file_path'] + image_extn)
+
+            if any(ext in frame[image_filename] for ext in ['png', 'jpg']):
+                fname = os.path.join(basedir, frame[image_filename])
+            else:
+                fname = os.path.join(basedir, frame[image_filename] + image_extn)
+
             assert os.path.isfile(fname), f'fname not found at: {fname}'
             filenames.append(fname)
             imgs.append(imageio.imread(fname))
@@ -94,7 +99,7 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         all_imgs.append(imgs)
         all_poses.append(poses)
         all_depth_maps.append(depth_maps)
-
+        all_filenames.append(filenames)
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
 
     extras = {}
@@ -116,12 +121,13 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         W = W//2
         focal = focal/2.
 
-
     if get_depths:
         all_depth_maps = np.concatenate(all_depth_maps, 0)
         extras['depth_maps'] = np.stack(all_depth_maps, axis=0)
     if 'K' in meta:
         extras['K'] = np.array(linemod_camera_intrinsics)
+
+    extras['filenames'] = all_filenames
 
     return imgs, poses, render_poses, [H, W, focal], i_split, extras
 

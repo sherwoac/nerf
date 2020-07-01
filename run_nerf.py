@@ -344,8 +344,12 @@ def render(H, W, focal,
     """
 
     if c2w is not None:
-        # special case to render full image
-        rays_o, rays_d = get_rays(H, W, focal, c2w)
+        if 'K' in kwargs:
+            rays_o, rays_d = get_rays_K(H, W, kwargs['K'], c2w)
+            del kwargs['K']
+        else:
+            # special case to render full image
+            rays_o, rays_d = get_rays(H, W, focal, c2w)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
@@ -655,7 +659,9 @@ def config_parser():
 
     parser.add_argument("--use_K", action='store_true', help='use_K - full camera model')
 
-    parser.add_argument("--image_filename", type=str, default='file_path', help='image_filename')
+    parser.add_argument("--image_filename", type=str, default='', help='image_filename')
+
+    parser.add_argument("--approximate_poses_filename", type=str, default='', help='approximate_poses_filename')
     return parser
 
 
