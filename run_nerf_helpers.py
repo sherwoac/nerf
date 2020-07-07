@@ -82,8 +82,7 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
 
-    print('MODEL', input_ch, input_ch_views, type(
-        input_ch), type(input_ch_views), use_viewdirs)
+    # print('MODEL', input_ch, input_ch_views, type(input_ch), type(input_ch_views), use_viewdirs)
     input_ch = int(input_ch)
     input_ch_views = int(input_ch_views)
 
@@ -92,7 +91,7 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
     inputs_pts.set_shape([None, input_ch])
     inputs_views.set_shape([None, input_ch_views])
 
-    print(inputs.shape, inputs_pts.shape, inputs_views.shape)
+    # print(inputs.shape, inputs_pts.shape, inputs_views.shape)
     outputs = inputs_pts
     for i in range(D):
         outputs = dense(W)(outputs)
@@ -136,7 +135,7 @@ def get_rays_K(H, W, K, c2w):
     f_y = K[1, 1]
     c_x = K[0, 2]
     c_y = K[1, 2]
-    skew = K[0, 1] # ??
+    # skew = K[0, 1] # ??
 
     i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
                        tf.range(H, dtype=tf.float32), indexing='xy')

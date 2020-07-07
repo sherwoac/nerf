@@ -7,6 +7,7 @@ import imageio
 import pprint
 import re
 import matplotlib.pyplot as plt
+import json
 
 import run_nerf as rn
 import run_nerf_helpers as rnh
@@ -17,9 +18,10 @@ import MODELS.tf_rotations
 import OUTPUT.image_tools
 import LOADER.dumb_loader as dl
 import create_linemod_data
+import MODELS.open3d_point_cloud_distance
 
 tf.compat.v1.enable_eager_execution()
-
+degree_sign= u'\N{DEGREE SIGN}'
 
 def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=True, masks=None, depth_images=None, K=None):
         # For random ray batching.
@@ -33,14 +35,14 @@ def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=
         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
         # for each pixel in the image. This stack() adds a new dimension.
         if K is not None:
-            print('get rays K')
+            # print('get rays K')
             rays = [rn.get_rays_np_K(H, W, K, p) for p in poses[:, :3, :4]]
         else:
-            print('get rays')
+            # print('get rays')
             rays = [rn.get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
 
         rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
-        print('done, concats')
+        # print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
         # [N, H, W, ro+rd+rgb, 3]
@@ -136,26 +138,32 @@ def find_rough_mask(args, render_kwargs, test_image, down, K):
     return np.where(resized_threshold_mask.astype(np.bool).ravel())
 
 
-def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, test_T, epochs=100, down=1, image_mask=None, test_depth_image=None, K=None):
+def optimize_model_to_single_image(args,
+                                   test_image,
+                                   render_kwargs,
+                                   grad_vars,
+                                   test_T,
+                                   epochs=100,
+                                   down=1,
+                                   image_mask=None,
+                                   test_depth_image=None,
+                                   K=None,
+                                   pcd=None):
     H, W, focal = test_image.shape[0]//down, test_image.shape[1]//down, 584./down
     optimizer = tf.keras.optimizers.Adam(args.lrate)
     identity_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
-    loss_list = []
-    rotation_difference = []
-    translation_difference = []
-    downsampled_image = downsample_image(np.copy(test_image), down)
+    img_loss_list = []
+    depth_loss_list = []
+    pcd_list = []
 
-    if test_depth_image is not None:
-        show_depth_map(test_depth_image)
+    downsampled_image = downsample_image(np.copy(test_image), down)
 
     loss_min = (float("inf"), )
     img_loss_min = (float("inf"), )
     depth_loss_min = (float("inf"), )
 
     for epoch in range(epochs):
-
         up_mask = find_rough_mask(args, render_kwargs, test_image, 16, K)
-
         ret = create_ray_batches(H,
                                  W,
                                  focal,
@@ -228,20 +236,21 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
             gradients = tape.gradient(loss, grad_vars)
             optimizer.apply_gradients(zip(gradients, grad_vars))
             T = np.squeeze(MODELS.rotations.np_rotation_9d_flat_to_transformation_matrix(grad_vars[0].numpy())).astype(np.float32)
-            diff = MODELS.rotations.compare_poses(T, test_T)
-            loss_list.append(loss.numpy())
-            rotation_difference.append(diff[0])
-            translation_difference.append(diff[1])
+            pcd_distance = pcd.get_distance_to_transformation(T, test_T)
 
-            print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss:1f} depth loss: {depth_loss:1f} diff: {diff[0] * 180. / np.pi:1f}deg {diff[1]:1f}m')
+            img_loss_list.append(img_loss.numpy())
+            depth_loss_list.append(depth_loss.numpy())
+            pcd_list.append(pcd_distance)
+
+            print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss:1f} depth loss: {depth_loss:1f} pcd: {pcd_distance}m')
             if loss.numpy() < loss_min[0]:
-                loss_min = (loss.numpy(), diff[0], diff[1])
+                loss_min = (loss.numpy(), pcd_distance)
 
             if img_loss.numpy() < img_loss_min[0]:
-                img_loss_min = (img_loss.numpy(), diff[0], diff[1])
+                img_loss_min = (img_loss.numpy(), pcd_distance)
 
             if depth_loss.numpy() < depth_loss_min[0]:
-                depth_loss_min = (depth_loss.numpy(), diff[0], diff[1])
+                depth_loss_min = (depth_loss.numpy(), pcd_distance)
 
             if args.visualize_optimization:
                 tiled = output_interim_results(test_image,
@@ -253,13 +262,12 @@ def optimize_model_to_single_image(args, test_image, render_kwargs, grad_vars, t
                                                threshold_mask)
                 imageio.imwrite(f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{str(epoch * 100 + i_batch).zfill(4)}.png', (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
 
-    plt.plot(loss_list, label='loss')
-    plt.plot(rotation_difference, label='rotation_difference')
-    plt.plot(translation_difference, label='translation_difference')
-    plt.legend()
-    plt.show()
-    results = {'loss_min':loss_min, 'img_loss_min':img_loss_min, 'depth_loss_min':depth_loss_min}
-
+    # plt.plot(loss_list, label='loss')
+    # plt.plot(rotation_difference, label='rotation_difference')
+    # plt.plot(translation_difference, label='translation_difference')
+    # plt.legend()
+    # plt.show()
+    results = {'img_loss_min': img_loss_list, 'depth_loss_min': depth_loss_list, 'pcd': pcd_list}
     return T, results
 
 
@@ -507,7 +515,7 @@ def test_perturbation_range(args, images, poses, depth_images, K):
                                                                    K=K)
 
 
-def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, test_depth_image, K):
+def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, test_depth_image, K, pcd=None):
     args.c2w = tf.Variable(
         MODELS.rotations.np_transformation_matrix_to_9d_flat(
             np.expand_dims(initial_pose, axis=0)
@@ -521,7 +529,7 @@ def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, tes
     }
 
     render_kwargs_test.update(bds_dict)
-    pprint.pprint(render_kwargs_test)
+    # pprint.pprint(render_kwargs_test)
     predicted_c2w, results = optimize_model_to_single_image(args,
                                                    test_image,
                                                    render_kwargs_test,
@@ -530,9 +538,10 @@ def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, tes
                                                    epochs=10,
                                                    image_mask=test_mask,
                                                    test_depth_image=test_depth_image,
-                                                   K=K)
+                                                   K=K,
+                                                            pcd=pcd)
 
-    return predicted_c2w
+    return predicted_c2w, results
 
 
 def show_depth_map(depth_map):
@@ -627,15 +636,42 @@ def render_depth_masks(args, images, poses, depth_images, masks):
         render_depth_mask(args, poses[i_test, :3, :4], H, W, focal, depth_images[i_test], masks[i_test])
 
 
-def load_approximate_poses(approximate_poses_filename):
+def load_centring_transforms(args):
+    assert os.path.exists(args.centring_transforms), f'args.centring_transforms not found at: {args.centring_transforms}'
+    with open(args.centring_transforms, 'r') as fp:
+        centring_transforms_dict = json.load(fp)
+        centring_transforms_dict_out = {key: np.array(value) for key, value in centring_transforms_dict.items()}
+    return centring_transforms_dict_out
+
+
+def get_object_name_from_filename(filename):
+    return str(filename).split('_')[0]
+
+
+def load_approximate_poses(approximate_poses_filename, centring_transforms_dict):
     assert os.path.isfile(approximate_poses_filename), \
         f'approximate_poses_filename not found at: {approximate_poses_filename}'
     df = dl.open_dataframe(approximate_poses_filename)
+    object_name = get_object_name_from_filename(df['filename'].iloc[0])
+    centring_transformation = centring_transforms_dict[object_name]
     return {int(df_row['frame_number']):
-        create_linemod_data.rub_to_rdf(
-            df_row['revised_pose'].astype(np.float32)
+        transformation_to_nerf_sense(
+            df_row['revised_pose'],
+            centring_transformation).astype(np.float32)
+            for _, df_row in df.iterrows()}
 
-    ) for _, df_row in df.iterrows()}
+
+def transformation_to_nerf_sense(T, centring_transformation):
+    return np.linalg.inv(create_linemod_data.rub_to_rdf(np.dot(T, centring_transformation)))
+
+
+def transformation_from_nerf_sense(T, centring_transformation):
+    return np.dot(create_linemod_data.rub_to_rdf(np.linalg.inv(T)), np.linalg.inv(centring_transformation))
+
+
+def print_string_diff(T1, T2):
+    diff_T1T2 = MODELS.rotations.compare_poses(T1, T2)
+    return f'{diff_T1T2[0] * 180./np.pi:.2g}{degree_sign} {diff_T1T2[1]:.2g}m'
 
 
 if __name__ == '__main__':
@@ -678,33 +714,66 @@ if __name__ == '__main__':
         args.near = tf.cast(near, tf.float32)
         args.far = tf.cast(far, tf.float32)
 
-    test_pose = poses[i_tests[0]]
     H, W = images[0].shape[:2]
     # render_depth_masks(args, images, poses, depth_images, masks)
     # show_test_images_at_c2w([poses[i_test, :3, :4]], test_image, render_kwargs_test)
     # render_both_ways(args, test_pose, H, W, extras['K'])
+    if args.centring_transforms:
+        centring_transforms_dict = load_centring_transforms(args)
+
     if args.approximate_poses_filename:
-        approximate_pose_dict = load_approximate_poses(args.approximate_poses_filename)
+        approximate_pose_dict = load_approximate_poses(args.approximate_poses_filename, centring_transforms_dict)
+        df = dl.open_dataframe(args.approximate_poses_filename)
+        transformation_pcd_function = lambda T: transformation_from_nerf_sense(T, centring_transformation)
+        pcd_distance = MODELS.open3d_point_cloud_distance.PointCloudDistance(df['shape_filename'].iloc[0],
+                                                                             transformation_function=transformation_pcd_function)
+        object_name = get_object_name_from_filename(df['filename'].iloc[0])
+        centring_transformation = centring_transforms_dict[object_name]
 
     overall_results = {}
     predicted_poses = []
+    test_to_initial_pcd_distances = []
+
     for i, i_test in enumerate(i_tests):
         filename = extras['filenames'][2][i]
         frame_number = int(re.findall(r'\d+', filename)[-1])
         test_image = images[i_test]
         test_mask = masks[i]
         test_depth_image = depth_images[i_test]
-        initial_pose = approximate_pose_dict[frame_number]
-        print(filename, MODELS.rotations.compare_poses(initial_pose, test_pose))
-        # predicted_c2w = train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, test_depth_image, K)
-        # predicted_poses.append(predicted_c2w)
-        # overall_results[i_test] = predicted_c2w
-        # diff_refined = MODELS.rotations.compare_poses(initial_pose, predicted_c2w)
-        # diff_test = MODELS.rotations.compare_poses(test_pose, predicted_c2w)
-        # print(f'i_test: {i_test} diff refined: {diff_refined[0] * 180. / np.pi:1f}deg {diff_refined[1]:1f}m {diff_test[0]} {diff_test[0]}')
+        bb8_pose = approximate_pose_dict[frame_number]
+        gt_pose = poses[i_test]
+        predicted_c2w, results = train_on_one_image(args, test_image, bb8_pose, gt_pose, test_mask, test_depth_image, K, pcd_distance)
+
+        gt_to_predicted = pcd_distance.get_distance_to_transformation(
+            transformation_from_nerf_sense(gt_pose, centring_transformation),
+            transformation_from_nerf_sense(predicted_c2w, centring_transformation)
+        )
+
+        gt_to_bb8 = pcd_distance.get_distance_to_transformation(
+            transformation_from_nerf_sense(gt_pose, centring_transformation),
+            transformation_from_nerf_sense(bb8_pose, centring_transformation)
+        )
+        predicted_poses.append(predicted_c2w)
+        test_to_initial_pcd_distances.append(gt_to_predicted)
+        overall_results[filename] = results
+        result_str = 'worse'
+        if gt_to_bb8 > gt_to_predicted:
+            result_str = 'better'
+
+        print(f'filename: {os.path.basename(filename)} {result_str} '
+              f'pcd GTvsNLM: {gt_to_predicted:.2g} '
+              f'GTvsBB8: {gt_to_bb8:.2g} '
+              f'{results}')
+
+# f'BB8->NLM: {print_string_diff(bb8_pose, predicted_c2w)} '
+# f'GT->NLM: {print_string_diff(gt_pose, predicted_c2w)} '
+# f'GT->BB8: {print_string_diff(gt_pose, bb8_pose)}
+
+    test_to_initial_pcd_distances = np.stack(test_to_initial_pcd_distances)
+    print(f'ADD measure: {np.sum(test_to_initial_pcd_distances < 0.1 * 0.259425) / test_to_initial_pcd_distances.shape[0]}')
 
     import pickle
     output = open('overall_results.pkl', 'wb')
     pickle.dump(overall_results, output)
     output.close()
-    plot_results()
+    # plot_results()

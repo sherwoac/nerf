@@ -3,6 +3,9 @@ import json
 import numpy as np
 import imageio as iio
 import tensorflow as tf
+from pathlib import Path
+import open3d as o3d
+
 
 linemod_camera_intrinsics = np.array([[572.4114, 0., 325.2611], [0., 573.57043, 242.04899], [0., 0., 1.]]).astype(np.float32)
 
@@ -42,6 +45,52 @@ def rub_to_rdf(T):
     rub_to_rdf_transform[1, 1] = -1
     rub_to_rdf_transform[2, 2] = -1
     return np.dot(rub_to_rdf_transform, T)
+
+
+def get_transformation_between_objects(source, target, trans_init=None):
+    threshold = 0.1
+    if trans_init is None:
+        trans_init = np.eye(4)
+        trans_init[1, 1] *= -1
+        trans_init[2, 2] *= -1
+    reg_p2l = o3d.registration.registration_icp(
+        source, target, threshold, trans_init,
+        o3d.registration.TransformationEstimationPointToPlane())
+    assert np.allclose(np.linalg.det(reg_p2l.transformation), 1.0)
+    return reg_p2l.transformation
+
+
+def make_cuboid_from_D(cuboid):
+    """
+
+    :param cuboid: dimensions of the cube
+    :return: 8 3d points describing the corners of the box
+    """
+    x, y, z = 0.5*cuboid[0], 0.5*cuboid[1], 0.5*cuboid[2]
+    return np.array([[x, -y, -z],
+                     [x, y, -z],
+                     [x, -y, z],
+                     [x, y, z],
+                     [-x, -y, -z],
+                     [-x, y, -z],
+                     [-x, -y, z],
+                     [-x, y, z]], dtype=np.float32)
+
+
+def get_object_info(object_class, path_linemod, path_linemod_orig):
+    object_path_mesh = Path(path_linemod_orig) / Path(object_class) / str('mesh.ply')
+    assert object_path_mesh.exists(), f'object_path_mesh not found at: {str(object_path_mesh)}'
+    object_mesh_point_cloud = o3d.io.read_point_cloud(str(object_path_mesh))
+    object_mesh_point_cloud = object_mesh_point_cloud.scale(0.001, np.array([0., 0., 0.]))
+    object_dimensions = object_mesh_point_cloud.get_max_bound() - object_mesh_point_cloud.get_min_bound()
+    centred_object_bounding_box = make_cuboid_from_D(object_dimensions)
+
+    object_class_path = Path(path_linemod) / Path(object_class) / (str(object_class) + '.ply')
+    assert object_class_path.exists(), f'object_mesh_path not found at: {str(object_class_path)}'
+    object_class_point_cloud = o3d.io.read_point_cloud(str(object_class_path))
+
+    centring_transformation = get_transformation_between_objects(object_mesh_point_cloud, object_class_point_cloud)
+    return object_class_path, object_path_mesh, object_dimensions, centred_object_bounding_box, centring_transformation, object_class_point_cloud, object_mesh_point_cloud
 
 
 def parse_linemod_pose(path_tra, path_rot):
@@ -233,6 +282,28 @@ class LinemodLoader(object):
 
         return object_dictionary
 
+    def make_centring_transformations(self):
+        centring_dict = {}
+        for object_name in LinemodLoader.linemod_objects:
+            object_class_path, \
+            object_path_mesh, \
+            object_dimensions, \
+            centred_object_bounding_box, \
+            centring_transformation, \
+            object_class_point_cloud, \
+            object_mesh_point_cloud = get_object_info(object_name,
+                                                      LinemodLoader.linemod_dataset_dir,
+                                                      LinemodLoader.linemod_orig_dir)
+            centring_dict[object_name] = centring_transformation.tolist()
+
+        transform_output_directory = os.path.join(self.output_directory)
+        output_json_filename = os.path.join(transform_output_directory, f'centring_transforms.json')
+        with open(output_json_filename, 'w') as outfile:
+            json.dump(centring_dict, outfile)
+
+        assert os.path.isfile(output_json_filename), f'output_json_filename not found at:{output_json_filename}'
+        print(f'written to: {output_json_filename}')
+
 
 if __name__ == '__main__':
     tf.compat.v1.enable_eager_execution()
@@ -240,3 +311,4 @@ if __name__ == '__main__':
     lml.make_jsons()
     # lml.make_mini(102)
     # lml.make_mini_all()
+    lml.make_centring_transformations()

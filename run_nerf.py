@@ -411,7 +411,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     t = time.time()
     for i, c2w in enumerate(render_poses):
-        print(i, time.time() - t)
+        # print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(
             H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
@@ -454,8 +454,6 @@ def create_nerf(args):
     grad_vars = model.trainable_variables
     models = {'model': model}
 
-
-
     model_fine = None
     if args.N_importance > 0:
         model_fine = init_nerf_model(
@@ -486,7 +484,7 @@ def create_nerf(args):
 
     # NDC only good for LLFF-style forward facing data
     if args.dataset_type != 'llff' or args.no_ndc:
-        print('Not ndc!')
+        # print('Not ndc!')
         render_kwargs_train['ndc'] = False
         render_kwargs_train['lindisp'] = args.lindisp
 
@@ -504,18 +502,18 @@ def create_nerf(args):
     else:
         ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
                  ('model_' in f and 'fine' not in f and 'optimizer' not in f)]
-    print('Found ckpts', ckpts)
+    # print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
         ft_weights = ckpts[-1]
-        print('Reloading from', ft_weights)
+        # print('Reloading from', ft_weights)
         model.set_weights(np.load(ft_weights, allow_pickle=True))
         start = int(ft_weights[-10:-4]) + 1
-        print('Resetting step to', start)
+        # print('Resetting step to', start)
 
         if model_fine is not None:
             ft_weights_fine = '{}_fine_{}'.format(
                 ft_weights[:-11], ft_weights[-10:])
-            print('Reloading fine from', ft_weights_fine)
+            # print('Reloading fine from', ft_weights_fine)
             model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, models
@@ -659,9 +657,16 @@ def config_parser():
 
     parser.add_argument("--use_K", action='store_true', help='use_K - full camera model')
 
-    parser.add_argument("--image_filename", type=str, default='', help='image_filename')
+    parser.add_argument("--image_filename", type=str, default='file_path', help='image_filename')
 
     parser.add_argument("--approximate_poses_filename", type=str, default='', help='approximate_poses_filename')
+
+    parser.add_argument("--centring_transforms", type=str, help='centring_transforms')
+
+    parser.add_argument("--img_loss_threshold", type=float, help='img_loss_threshold')
+
+    parser.add_argument("--depth_loss_threshold", type=float, help='depth_loss_threshold')
+
     return parser
 
 
