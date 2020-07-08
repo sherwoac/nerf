@@ -161,6 +161,7 @@ def optimize_model_to_single_image(args,
     loss_min = (float("inf"), )
     img_loss_min = (float("inf"), )
     depth_loss_min = (float("inf"), )
+    initial_transformation = np.copy(grad_vars[0].numpy())
 
     for epoch in range(epochs):
         up_mask = find_rough_mask(args, render_kwargs, test_image, 16, K)
@@ -208,6 +209,7 @@ def optimize_model_to_single_image(args,
                     H, W, focal, rays=batch_rays, retraw=True, **render_kwargs)
 
                 # Compute MSE loss between predicted and true RGB.
+                depth_loss = tf.constant(value=0., shape=0, dtype=tf.float32)
                 if args.sigma_threshold > 0.:
                     threshold_mask = tf.where(acc > args.sigma_threshold)
                     # img_loss = 1 / (int(threshold_mask.shape[0]) + .001)
@@ -215,13 +217,11 @@ def optimize_model_to_single_image(args,
                     if test_depth_image is not None:
                         # print(tf.reduce_mean(extras['depth_map']), extras['depth_map'].numpy().min(), extras['depth_map'].numpy().max())
                         depth_loss = tf.reduce_mean(tf.abs(tf.gather_nd(extras['depth_map'], threshold_mask) - tf.gather_nd(depth_batch, threshold_mask)))
-                    else:
-                        depth_loss = 0.
                 else:
                     img_loss = rnh.img2mse(rgb, target_s)
 
                 trans = extras['raw'][..., -1]
-                loss = img_loss + 100.*depth_loss
+                loss = img_loss  # + 100.*depth_loss
                 # psnr = rnh.mse2psnr(img_loss)
 
                 # Add MSE loss for coarse-grained model
@@ -242,37 +242,40 @@ def optimize_model_to_single_image(args,
             depth_loss_list.append(depth_loss.numpy())
             pcd_list.append(pcd_distance)
 
-            print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss:1f} depth loss: {depth_loss:1f} pcd: {pcd_distance}m')
+            # print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss.numpy():1f} depth loss: {depth_loss.numpy():1f} pcd: {pcd_distance}m')
+            print(
+                f'epoch: {epoch + 1}/{epochs} batch: {i_batch + 1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss.numpy():1f} pcd: {pcd_distance}m')
             if loss.numpy() < loss_min[0]:
                 loss_min = (loss.numpy(), pcd_distance)
 
             if img_loss.numpy() < img_loss_min[0]:
                 img_loss_min = (img_loss.numpy(), pcd_distance)
 
-            if depth_loss.numpy() < depth_loss_min[0]:
-                depth_loss_min = (depth_loss.numpy(), pcd_distance)
+            # if depth_loss.numpy() < depth_loss_min[0]:
+            #     depth_loss_min = (depth_loss.numpy(), pcd_distance)
 
             if args.visualize_optimization:
                 tiled = output_interim_results(test_image,
                                                render_kwargs,
                                                test_depth_image,
                                                image_mask,
-                                               shuffled_coordinates,
                                                batch_indices,
-                                               threshold_mask)
+                                               threshold_mask,
+                                               initial_transformation)
                 imageio.imwrite(f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{str(epoch * 100 + i_batch).zfill(4)}.png', (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
 
-    # plt.plot(loss_list, label='loss')
-    # plt.plot(rotation_difference, label='rotation_difference')
-    # plt.plot(translation_difference, label='translation_difference')
-    # plt.legend()
-    # plt.show()
     results = {'img_loss_min': img_loss_list, 'depth_loss_min': depth_loss_list, 'pcd': pcd_list}
     return T, results
 
 
-def output_interim_results(test_image, render_kwargs, test_depth_image, image_mask, shuffled_coordinates, batch_indices, threshold_mask):
-    H, W =test_image.shape[:2]
+def output_interim_results(test_image,
+                           render_kwargs,
+                           test_depth_image,
+                           image_mask,
+                           batch_indices,
+                           threshold_mask,
+                           initial_transformation):
+    H, W = test_image.shape[:2]
     rgb, disp, acc, extras = rn.render(H, W, 1.0, c2w=np.eye(4, dtype=np.float32)[:3, :4], **render_kwargs)
     threshold_full_mask = tf.where(acc > args.sigma_threshold, tf.ones(shape=rgb.shape[:2]),
                                    tf.zeros(shape=rgb.shape[:2]))
@@ -304,6 +307,22 @@ def output_interim_results(test_image, render_kwargs, test_depth_image, image_ma
             [[make_rgb(acc), test_image_output, get_mpl_array_plot(depth3), test_depth_image_norm],
              [overlap, rgb_thresholded, get_mpl_array_plot(depth_th3),
               get_mpl_array_plot(depth_thresholded - thresholded_gt_depth)]]
+        ),
+    )
+    return tiled
+
+
+def output_results(test_image,
+                   render_kwargs,
+                   initial_transformation_rgb,
+                   K):
+    H, W = test_image.shape[:2]
+    render_kwargs['K'] = K
+    rgb_predicted, disp, acc, extras = rn.render(H, W, 1.0, c2w=np.eye(4, dtype=np.float32)[:3, :4], **render_kwargs)
+    tiled = OUTPUT.image_tools.tile_images(
+        np.array(
+            [[test_image, rgb_predicted],
+             [make_rgb(acc), initial_transformation_rgb]]
         ),
     )
     return tiled
@@ -535,13 +554,32 @@ def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, tes
                                                    render_kwargs_test,
                                                    [args.c2w],
                                                    test_pose,
-                                                   epochs=10,
+                                                   epochs=args.epochs,
                                                    image_mask=test_mask,
                                                    test_depth_image=test_depth_image,
                                                    K=K,
                                                             pcd=pcd)
 
     return predicted_c2w, results
+
+
+def render_an_image(args, T, H, W, K):
+    args.c2w = tf.Variable(
+        MODELS.rotations.np_transformation_matrix_to_9d_flat(
+            np.expand_dims(T, axis=0)
+        ),
+        name='c2w')
+    # Create nerf model
+    _, render_kwargs_test, _, _, models = rn.create_nerf(args)
+    bds_dict = {
+        'near': args.near,
+        'far': args.far
+    }
+
+    render_kwargs_test.update(bds_dict)
+    render_kwargs_test['K'] = K
+    rgb_predicted, _, _, _ = rn.render(H, W, 1.0, c2w=np.eye(4, dtype=np.float32)[:3, :4], **render_kwargs_test)
+    return rgb_predicted.numpy()
 
 
 def show_depth_map(depth_map):
@@ -738,21 +776,52 @@ if __name__ == '__main__':
         filename = extras['filenames'][2][i]
         frame_number = int(re.findall(r'\d+', filename)[-1])
         test_image = images[i_test]
-        test_mask = masks[i]
-        test_depth_image = depth_images[i_test]
+
+        if args.mask_directory is not None:
+            test_mask = masks[i]
+        else:
+            test_mask = None
+
+        if args.get_depth_maps:
+            test_depth_image = depth_images[i_test]
+        else:
+            test_depth_image = None
+
         bb8_pose = approximate_pose_dict[frame_number]
         gt_pose = poses[i_test]
         predicted_c2w, results = train_on_one_image(args, test_image, bb8_pose, gt_pose, test_mask, test_depth_image, K, pcd_distance)
+        if args.visualize_results:
+            bb8_render_image = render_an_image(args, bb8_pose, H, W, K)
+            predicted_render_image = render_an_image(args, predicted_c2w, H, W, K)
+            diff_renders_image = bb8_render_image - predicted_render_image
+            diff_renders_image -= diff_renders_image.min(axis=(0, 1))
+            diff_renders_image /= diff_renders_image.max(axis=(0, 1))
 
-        gt_to_predicted = pcd_distance.get_distance_to_transformation(
-            transformation_from_nerf_sense(gt_pose, centring_transformation),
-            transformation_from_nerf_sense(predicted_c2w, centring_transformation)
-        )
+            diff_test_predicted_image = test_image - predicted_render_image
+            diff_test_predicted_image -= diff_test_predicted_image.min(axis=(0, 1))
+            diff_test_predicted_image /= diff_test_predicted_image.max(axis=(0, 1))
 
-        gt_to_bb8 = pcd_distance.get_distance_to_transformation(
-            transformation_from_nerf_sense(gt_pose, centring_transformation),
-            transformation_from_nerf_sense(bb8_pose, centring_transformation)
-        )
+            tiled = OUTPUT.image_tools.tile_images(
+                np.array(
+                    [[test_image, bb8_render_image, predicted_render_image],
+                     [np.zeros_like(test_image), diff_renders_image, diff_test_predicted_image]]
+                )
+            )
+            imageio.imwrite(
+                f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{os.path.basename(filename).replace("jpg","png")}',
+                (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
+        # gt_to_predicted = pcd_distance.get_distance_to_transformation(
+        #     transformation_from_nerf_sense(gt_pose, centring_transformation),
+        #     transformation_from_nerf_sense(predicted_c2w, centring_transformation)
+        # )
+        #
+        # gt_to_bb8 = pcd_distance.get_distance_to_transformation(
+        #     transformation_from_nerf_sense(gt_pose, centring_transformation),
+        #     transformation_from_nerf_sense(bb8_pose, centring_transformation)
+        # )
+        gt_to_predicted = pcd_distance.get_distance_to_transformation(gt_pose, predicted_c2w)
+        gt_to_bb8 = pcd_distance.get_distance_to_transformation(gt_pose, bb8_pose)
+
         predicted_poses.append(predicted_c2w)
         test_to_initial_pcd_distances.append(gt_to_predicted)
         overall_results[filename] = results

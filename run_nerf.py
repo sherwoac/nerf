@@ -654,7 +654,7 @@ def config_parser():
     parser.add_argument("--force_black_background", action='store_true', help='force_black_background')
 
     parser.add_argument("--visualize_optimization", action='store_true', help='visualize_optimization')
-
+    parser.add_argument("--visualize_results", action='store_true', help='visualize_results')
     parser.add_argument("--use_K", action='store_true', help='use_K - full camera model')
 
     parser.add_argument("--image_filename", type=str, default='file_path', help='image_filename')
@@ -666,6 +666,8 @@ def config_parser():
     parser.add_argument("--img_loss_threshold", type=float, help='img_loss_threshold')
 
     parser.add_argument("--depth_loss_threshold", type=float, help='depth_loss_threshold')
+
+    parser.add_argument("--epochs", type=int, default=10, help='number of epochs')
 
     return parser
 
