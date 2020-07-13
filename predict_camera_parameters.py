@@ -748,7 +748,7 @@ if __name__ == '__main__':
     if args.Z_limits_from_pose:
         Zs = poses[:, 2, 3]
         near = np.min(np.abs(Zs)) * 0.9
-        far = np.max(np.abs(Zs)) * 1.5
+        far = np.max(np.abs(Zs)) * 2.
         args.near = tf.cast(near, tf.float32)
         args.far = tf.cast(far, tf.float32)
 
@@ -771,10 +771,14 @@ if __name__ == '__main__':
     overall_results = {}
     predicted_poses = []
     test_to_initial_pcd_distances = []
-
     for i, i_test in enumerate(i_tests):
         filename = extras['filenames'][2][i]
         frame_number = int(re.findall(r'\d+', filename)[-1])
+        output_filename = os.path.join(args.output_directory, f'results_dict_{str(frame_number).zfill(4)}.pkl')
+        if os.path.isfile(output_filename):
+            print(f'file ({output_filename}) already exists, skipping: {os.path.isfile(output_filename)}')
+            continue
+
         test_image = images[i_test]
 
         if args.mask_directory is not None:
@@ -807,8 +811,7 @@ if __name__ == '__main__':
                      [np.zeros_like(test_image), diff_renders_image, diff_test_predicted_image]]
                 )
             )
-            imageio.imwrite(
-                f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{os.path.basename(filename).replace("jpg","png")}',
+            imageio.imwrite(os.path.join(args.output_directory, f'tiled_{str(frame_number).zfill(4)}.png'),
                 (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
         # gt_to_predicted = pcd_distance.get_distance_to_transformation(
         #     transformation_from_nerf_sense(gt_pose, centring_transformation),
@@ -829,20 +832,29 @@ if __name__ == '__main__':
         if gt_to_bb8 > gt_to_predicted:
             result_str = 'better'
 
+        results_dict = {'filename': filename,
+                        'frame_number': frame_number,
+                        'predicted_c2w_pose': predicted_c2w,
+                        'gt_c2w_pose': gt_pose,
+                        'bb8_pose': bb8_pose,
+                        'worse/better': result_str,
+                        'gt_to_predicted': gt_to_predicted,
+                        'gt_to_bb8': gt_to_bb8}
+
         print(f'filename: {os.path.basename(filename)} {result_str} '
               f'pcd GTvsNLM: {gt_to_predicted:.2g} '
-              f'GTvsBB8: {gt_to_bb8:.2g} '
-              f'{results}')
+              f'GTvsBB8: {gt_to_bb8:.2g} ')
 
-# f'BB8->NLM: {print_string_diff(bb8_pose, predicted_c2w)} '
-# f'GT->NLM: {print_string_diff(gt_pose, predicted_c2w)} '
-# f'GT->BB8: {print_string_diff(gt_pose, bb8_pose)}
+        import pickle
+        output = open(os.path.join(args.output_directory, f'results_dict_{str(frame_number).zfill(4)}.pkl'), 'wb')
+        pickle.dump(overall_results, output)
+        output.close()
 
     test_to_initial_pcd_distances = np.stack(test_to_initial_pcd_distances)
     print(f'ADD measure: {np.sum(test_to_initial_pcd_distances < 0.1 * 0.259425) / test_to_initial_pcd_distances.shape[0]}')
 
-    import pickle
-    output = open('overall_results.pkl', 'wb')
-    pickle.dump(overall_results, output)
-    output.close()
+    # import pickle
+    # output = open('overall_results.pkl', 'wb')
+    # pickle.dump(overall_results, output)
+    # output.close()
     # plot_results()

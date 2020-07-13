@@ -669,6 +669,7 @@ def config_parser():
 
     parser.add_argument("--epochs", type=int, default=10, help='number of epochs')
 
+    parser.add_argument("--output_directory", type=str, default='./', help='output_directory')
     return parser
 
 
