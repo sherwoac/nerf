@@ -742,8 +742,8 @@ def train():
 
         if args.Z_limits_from_pose:
             Zs = poses[:, 2, 3]
-            near = np.min(np.abs(Zs)) * 0.9
-            far = np.max(np.abs(Zs)) * 1.1
+            near = np.min(np.abs(Zs)) * 0.5
+            far = np.max(np.abs(Zs)) * 1.5
 
         elif args.get_depth_maps and args.mask_directory is not None:
             near = np.min(np.mean(depth_maps[masks])) * 0.9
@@ -755,21 +755,21 @@ def train():
             far = np.max(depth_maps) * 1.1
 
         else:
-            near = 2.
-            far = 6.
+            near = 0.
+            far = 2.
 
         print(f'near: {near} far: {far}')
 
-        if args.white_bkgd and args.mask_directory is not None:
+        if args.mask_directory is not None:
             images = np.concatenate([images, masks[..., np.newaxis]], axis=-1)
+
+        if args.white_bkgd:
             images = images[..., :3] * images[..., -1:] + (1. - images[..., -1:])
-        elif args.white_bkgd:
-            images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
         else:
             images = images[..., :3]
-        # import matplotlib.pyplot as plt
-        # plt.hist(images.ravel())
-        # plt.show()
+        import matplotlib.pyplot as plt
+        plt.imshow(images[0])
+        plt.show()
     elif args.dataset_type == 'deepvoxels':
 
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
@@ -985,11 +985,10 @@ def train():
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
-            loss = 0
             if args.sigma_masking:
-                loss += img2mse(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
+                loss = img2mse(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
             else:
-                loss += img2mse(rgb, target_s)
+                loss = img2mse(rgb, target_s)
 
             if args.force_black_background:
                 loss += 0.1 * img2mse(rgb[~in_mask_pixels_batch], 0.)
