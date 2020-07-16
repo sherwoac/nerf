@@ -50,11 +50,12 @@ def linemod_dpt(path):
     return (np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols)) / 1000.).astype(np.float32)
 
 
-def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None, image_filename='file_path'):
+def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None, image_field='file_path'):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
-        with open(os.path.join(basedir, 'transforms_{}.json'.format(s)), 'r') as fp:
+        json_filename = os.path.join(basedir, f'transforms_{s}.json')
+        with open(json_filename, 'r') as fp:
             metas[s] = json.load(fp)
 
     all_imgs = []
@@ -73,24 +74,27 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
             skip = testskip
         filenames = []
         for frame in meta['frames'][::skip]:
-
-            if any(ext in frame[image_filename] for ext in ['png', 'jpg']):
-                fname = os.path.join(basedir, frame[image_filename])
+            if any(ext in frame[image_field] for ext in ['png', 'jpg']):
+                image_filename = os.path.join(basedir, frame[image_field])
             else:
-                fname = os.path.join(basedir, frame[image_filename] + image_extn)
+                image_filename = os.path.join(basedir, frame[image_field] + image_extn)
 
-            assert os.path.isfile(fname), f'fname not found at: {fname}'
-            filenames.append(fname)
-            imgs.append(imageio.imread(fname))
-            poses.append(np.array(frame['transform_matrix']))
+            assert os.path.isfile(image_filename), f'fname not found at: {image_filename}'
+            filenames.append(image_filename)
+
+            image = imageio.imread(image_filename)
+            imgs.append(image)
+
+            pose = np.array(frame['transform_matrix'])
+            poses.append(pose)
             if get_depths and 'depth_path' in frame:
                 #eg. r_0_depth_0001.png
-                filename = frame['depth_path']
-                assert os.path.isfile(filename), f'filename:{filename} not found'
-                if '.png' in filename:
-                    depth = imageio.imread(filename)
-                elif '.dpt' in filename:
-                    depth = linemod_dpt(filename)
+                depth_filename = frame['depth_path']
+                assert os.path.isfile(depth_filename), f'filename:{depth_filename} not found'
+                if '.png' in depth_filename:
+                    depth = imageio.imread(depth_filename)
+                elif '.dpt' in depth_filename:
+                    depth = linemod_dpt(depth_filename)
                 depth_maps.append(depth)
 
         imgs = (np.array(imgs) / 255.).astype(np.float32) # keep all 4 channels (RGBA)
@@ -104,7 +108,8 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
 
     extras = {}
     if mask_directory is not None:
-        extras['masks'] = load_masks(basedir, mask_directory, filenames)
+        list_of_image_files = [item for sublist in all_filenames for item in sublist]
+        extras['masks'] = load_masks(basedir, mask_directory, list_of_image_files)
 
     imgs = np.concatenate(all_imgs, 0)
     poses = np.concatenate(all_poses, 0)
@@ -124,6 +129,7 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
     if get_depths:
         all_depth_maps = np.concatenate(all_depth_maps, 0)
         extras['depth_maps'] = np.stack(all_depth_maps, axis=0)
+
     if 'K' in meta:
         extras['K'] = np.array(linemod_camera_intrinsics)
 

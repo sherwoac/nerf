@@ -13,6 +13,8 @@ from load_llff import load_llff_data, load_masks
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 import MODELS.tf_rotations
+from OUTPUT.image_tools import tile_images
+import predict_camera_parameters
 
 
 def batchify(fn, chunk):
@@ -657,7 +659,7 @@ def config_parser():
     parser.add_argument("--visualize_results", action='store_true', help='visualize_results')
     parser.add_argument("--use_K", action='store_true', help='use_K - full camera model')
 
-    parser.add_argument("--image_filename", type=str, default='file_path', help='image_filename')
+    parser.add_argument("--image_fieldname", type=str, default='file_path', help='image_fieldname')
 
     parser.add_argument("--approximate_poses_filename", type=str, default='', help='approximate_poses_filename')
 
@@ -670,6 +672,9 @@ def config_parser():
     parser.add_argument("--epochs", type=int, default=10, help='number of epochs')
 
     parser.add_argument("--output_directory", type=str, default='./', help='output_directory')
+
+    parser.add_argument("--use_huber_loss", action='store_true', help='use_huber_loss')
+
     return parser
 
 
@@ -725,7 +730,13 @@ def train():
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split, extras = load_blender_data(
-            args.datadir, args.half_res, args.testskip, args.image_extn, mask_directory=args.mask_directory, get_depths=args.get_depth_maps, image_filename=args.image_filename)
+            args.datadir,
+            args.half_res,
+            args.testskip,
+            args.image_extn,
+            mask_directory=args.mask_directory,
+            get_depths=args.get_depth_maps,
+            image_field=args.image_fieldname)
 
         if args.mask_directory is not None:
             masks = extras['masks']
@@ -760,16 +771,14 @@ def train():
 
         print(f'near: {near} far: {far}')
 
-        if args.mask_directory is not None:
+        if args.mask_directory is not None and images.shape[-1] == 3:
             images = np.concatenate([images, masks[..., np.newaxis]], axis=-1)
 
         if args.white_bkgd:
             images = images[..., :3] * images[..., -1:] + (1. - images[..., -1:])
         else:
             images = images[..., :3]
-        import matplotlib.pyplot as plt
-        plt.imshow(images[0])
-        plt.show()
+
     elif args.dataset_type == 'deepvoxels':
 
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
@@ -789,7 +798,7 @@ def train():
         return
 
 
-    if args.mask_directory:
+    if args.mask_directory and not args.white_bkgd:
         assert os.path.isdir(args.mask_directory), f'args.mask_directory not found at: {args.mask_directory}'
         if args.mask_images:
             images *= masks[..., np.newaxis]
@@ -861,6 +870,10 @@ def train():
     global_step = tf.compat.v1.train.get_or_create_global_step()
     global_step.assign(start)
 
+    photometric_loss_function = img2mse
+    if args.use_huber_loss:
+        photometric_loss_function = tf.compat.v1.losses.huber_loss
+
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
     use_batching = not args.no_batching
@@ -918,7 +931,6 @@ def train():
     writer = tf.contrib.summary.create_file_writer(
         os.path.join(basedir, 'summaries', expname))
     writer.set_as_default()
-
     for i in range(start, N_iters):
         time0 = time.time()
 
@@ -986,12 +998,12 @@ def train():
 
             # Compute MSE loss between predicted and true RGB.
             if args.sigma_masking:
-                loss = img2mse(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
+                loss = photometric_loss_function(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
             else:
-                loss = img2mse(rgb, target_s)
+                loss = photometric_loss_function(rgb, target_s)
 
             if args.force_black_background:
-                loss += 0.1 * img2mse(rgb[~in_mask_pixels_batch], 0.)
+                loss += 0.1 * photometric_loss_function(rgb[~in_mask_pixels_batch], 0.)
 
             trans = extras['raw'][..., -1]
             psnr = mse2psnr(loss)
@@ -1002,16 +1014,16 @@ def train():
             # Add MSE loss for coarse-grained model
             if 'rgb0' in extras:
                 if args.sigma_masking:
-                    img_loss0 = img2mse(extras['rgb0'][in_mask_pixels_batch], target_s[in_mask_pixels_batch])
+                    img_loss0 = photometric_loss_function(extras['rgb0'][in_mask_pixels_batch], target_s[in_mask_pixels_batch])
                     psnr0 = mse2psnr(img_loss0)
                     loss += img_loss0 + 0.01 * tf.reduce_sum(extras['acc0'][~in_mask_pixels_batch]) / N_rand
                 else:
-                    img_loss0 = img2mse(extras['rgb0'], target_s)
+                    img_loss0 = photometric_loss_function(extras['rgb0'], target_s)
                     psnr0 = mse2psnr(img_loss0)
                     loss += img_loss0
 
                 if args.force_black_background:
-                    loss += 0.1 * img2mse(extras['rgb0'][~in_mask_pixels_batch], 0.)
+                    loss += 0.1 * photometric_loss_function(extras['rgb0'][~in_mask_pixels_batch], 0.)
 
 
         gradients = tape.gradient(loss, grad_vars)

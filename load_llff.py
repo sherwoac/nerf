@@ -63,6 +63,9 @@ def get_list_of_image_filenames(base_directory):
                                sorted(os.listdir(os.path.join(base_directory, 'images'))) \
                                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
 
+def make_rgb(single_channel_image):
+    return np.concatenate([single_channel_image[:, :, np.newaxis], single_channel_image[:, :, np.newaxis], single_channel_image[:, :, np.newaxis]], axis=-1)
+
 
 def load_masks(base_directory, mask_directory, list_of_image_filenames=None):
     if list_of_image_filenames is None:
@@ -78,13 +81,8 @@ def load_masks(base_directory, mask_directory, list_of_image_filenames=None):
         masks.append(bool_mask[:, :, 0])
 
     masks = np.stack(masks, axis=0)
+
     return masks
-
-
-
-
-
-
 
 
 def _load_data(base_directory, factor=None, width=None, height=None, load_imgs=True, mask_directory=None):

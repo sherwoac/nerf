@@ -20,16 +20,14 @@ def focal_to_camera_angle_x(focal_x, W):
 
 
 def transform_pose(pose: np.ndarray):
-    ret_pose = np.linalg.inv(pose)
-    ret_pose[:3, 3] *= -1.
-    return ret_pose
+    return np.linalg.inv(rub_to_rdf(pose))
 
 
 class DatasetItem(object):
     def __init__(self, image_filename, render_filename, pose:np.ndarray, camera_angle_x, depth_filename):
         self.image_filename = image_filename
         self.render_filename = render_filename
-        self.pose = np.linalg.inv(rub_to_rdf(pose))
+        self.pose = transform_pose(pose)
         self.camera_angle_x = camera_angle_x
         self.depth_filename = depth_filename
 
@@ -204,6 +202,7 @@ class LinemodLoader(object):
         for object_name in LinemodLoader.linemod_objects:
             obj_output_directory = os.path.join(self.output_directory, object_name)
             dataset_ids = get_datasets(LinemodLoader.linemod_dataset_dir, object_name)
+            render_dir = os.path.join(LinemodLoader.render_sub_dir, object_name)
             for test_train_dataset_name in LinemodLoader.dataset_names:
                 image_dir = os.path.join(LinemodLoader.linemod_orig_dir, object_name, 'data')
                 label_dir = image_dir
@@ -214,7 +213,7 @@ class LinemodLoader(object):
                 elif test_train_dataset_name == 'all':
                     ids = list(sorted([item for sublist in dataset_ids.values() for item in sublist]))
 
-                dataset_records, camera_angle_x, focal_length = get_records(ids, image_dir, label_dir)
+                dataset_records, camera_angle_x, focal_length = get_records(ids, image_dir, label_dir, render_dir)
                 images = []
                 poses = []
                 for dataset_record in dataset_records:
@@ -232,7 +231,7 @@ class LinemodLoader(object):
         for object_name in LinemodLoader.linemod_objects:
             obj_output_directory = os.path.join(self.output_directory, object_name)
             dataset_ids = get_datasets(LinemodLoader.linemod_dataset_dir, object_name)
-
+            render_dir = os.path.join(LinemodLoader.render_sub_dir, object_name)
             image_filenames = []
             poses = []
             dataset_names = []
@@ -247,7 +246,7 @@ class LinemodLoader(object):
                 elif test_train_dataset_name == 'all':
                     ids = list(sorted([item for sublist in dataset_ids.values() for item in sublist]))
 
-                dataset_records, camera_angle_x, focal_length = get_records(ids, image_dir, label_dir)
+                dataset_records, camera_angle_x, focal_length = get_records(ids, image_dir, label_dir, render_dir)
 
                 for dataset_record in dataset_records:
                     image_filenames.append(dataset_record.image_filename)
@@ -310,5 +309,5 @@ if __name__ == '__main__':
     lml = LinemodLoader()
     lml.make_jsons()
     # lml.make_mini(102)
-    # lml.make_mini_all()
+    lml.make_mini_all()
     lml.make_centring_transformations()

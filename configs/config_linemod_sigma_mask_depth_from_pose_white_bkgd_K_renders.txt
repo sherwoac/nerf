@@ -3,7 +3,7 @@ basedir = ./logs
 datadir = /home/adam/shared/LINEMOD/nerf/driller
 dataset_type = blender
 
-# mask_directory =  /home/adam/shared/LINEMOD/driller/mask
+mask_directory =  /home/adam/shared/LINEMOD/driller/mask
 # mask_images = False
 # ray_masking = False
 # sigma_masking = False
@@ -22,4 +22,6 @@ use_viewdirs = True
 N_rand = 1024
 image_extn = .jpg
 use_K = True
-image_filename = render_filename
+image_fieldname = render_filename
+
+# use_huber_loss = True
