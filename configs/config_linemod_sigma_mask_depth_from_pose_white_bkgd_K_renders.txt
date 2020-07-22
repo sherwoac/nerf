@@ -1,4 +1,4 @@
-expname = driller_linemod_sigma_mask_depth_from_pose_white_bkgd_K_renders_coloured
+expname = driller_linemod_sigma_mask_depth_from_pose_white_bkgd_K_renders_bright_chequered
 basedir = ./logs
 datadir = /home/adam/shared/LINEMOD/nerf/driller
 dataset_type = blender
@@ -23,5 +23,5 @@ N_rand = 1024
 image_extn = .jpg
 use_K = True
 image_fieldname = render_filename
-
+image_dir_override = /home/adam/shared/LINEMOD/renders_linemod/driller_chequered_bright
 # use_huber_loss = True

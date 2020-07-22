@@ -23,6 +23,7 @@ import MODELS.open3d_point_cloud_distance
 tf.compat.v1.enable_eager_execution()
 degree_sign= u'\N{DEGREE SIGN}'
 
+
 def create_ray_batches(H, W, focal, images, poses, i_train=[0], seed=0, shuffle=True, masks=None, depth_images=None, K=None):
         # For random ray batching.
         #
@@ -138,25 +139,55 @@ def find_rough_mask(args, render_kwargs, test_image, down, K):
     return np.where(resized_threshold_mask.astype(np.bool).ravel())
 
 
+def plot_loss_pcd(loss_list, pcd_list, threshold=0.025):
+    # plt.plot(loss_list, label='loss')
+    # plt.plot(pcd_list, label='pcd')
+    # plt.axhline(y=threshold, color='r', linestyle='-')
+    # plt.legend()
+    # plt.show()
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ln1 = ax.plot(loss_list, color='blue', label='loss')
+
+    ax2 = ax.twinx()
+    ln2 = ax2.plot(pcd_list, color='orange', label='pcd')
+    ax2.axhline(y=threshold, color='r', linestyle='-')
+
+    lns = ln1 + ln2
+    # added these three lines
+    labs = [l.get_label() for l in lns]
+    ax.legend(lns, labs, loc=2)
+    plt.show()
+
+
 def optimize_model_to_single_image(args,
                                    test_image,
                                    render_kwargs,
                                    grad_vars,
                                    test_T,
                                    epochs=100,
-                                   down=1,
+                                   resample=1., # downsample > 1 > upsample - eg. factor of increasing size
                                    image_mask=None,
                                    test_depth_image=None,
                                    K=None,
                                    pcd=None):
-    H, W, focal = test_image.shape[0]//down, test_image.shape[1]//down, 584./down
+    H, W, focal = int(test_image.shape[0]*resample), int(test_image.shape[1]*resample), 584.*resample
     optimizer = tf.keras.optimizers.Adam(args.lrate)
     identity_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
     img_loss_list = []
     depth_loss_list = []
     pcd_list = []
 
-    downsampled_image = downsample_image(np.copy(test_image), down)
+    if resample < 1.:
+        # downsample
+        sampled_image = downsample_image(np.copy(test_image), down)
+    elif resample > 1.:
+        # upsample
+        sampled_image = upsample_image(np.copy(test_image), 1 / down)
+    else:
+        sampled_image = np.copy(test_image)
+
 
     loss_min = (float("inf"), )
     img_loss_min = (float("inf"), )
@@ -168,7 +199,7 @@ def optimize_model_to_single_image(args,
         ret = create_ray_batches(H,
                                  W,
                                  focal,
-                                 np.expand_dims(downsampled_image, axis=0),
+                                 np.expand_dims(sampled_image, axis=0),
                                  np.expand_dims(identity_transformation, axis=0),
                                  seed=epoch,
                                  shuffle=True,
@@ -209,47 +240,60 @@ def optimize_model_to_single_image(args,
                     H, W, focal, rays=batch_rays, retraw=True, **render_kwargs)
 
                 # Compute MSE loss between predicted and true RGB.
-                depth_loss = tf.constant(value=0., shape=0, dtype=tf.float32)
+                # depth_loss = tf.constant(value=0., shape=0, dtype=tf.float32)
                 if args.sigma_threshold > 0.:
                     threshold_mask = tf.where(acc > args.sigma_threshold)
                     # img_loss = 1 / (int(threshold_mask.shape[0]) + .001)
                     img_loss = rnh.img2mse(tf.gather_nd(rgb, threshold_mask), tf.gather_nd(target_s, threshold_mask))
                     if test_depth_image is not None:
-                        # print(tf.reduce_mean(extras['depth_map']), extras['depth_map'].numpy().min(), extras['depth_map'].numpy().max())
-                        depth_loss = tf.reduce_mean(tf.abs(tf.gather_nd(extras['depth_map'], threshold_mask) - tf.gather_nd(depth_batch, threshold_mask)))
+                        depth_loss = tf.compat.v1.losses.absolute_difference(tf.gather_nd(extras['depth_map'], threshold_mask),
+                                                                             tf.gather_nd(depth_batch, threshold_mask))
+                    else:
+                        depth_loss = 0.
                 else:
                     img_loss = rnh.img2mse(rgb, target_s)
+                    if test_depth_image is not None:
+                        depth_loss = tf.compat.v1.losses.absolute_difference(extras['depth_map'], depth_batch)
+                    else:
+                        depth_loss = 0.
 
-                trans = extras['raw'][..., -1]
-                loss = img_loss  # + 100.*depth_loss
+                # trans = extras['raw'][..., -1]
+                loss = img_loss + depth_loss
+                # loss = depth_loss
                 # psnr = rnh.mse2psnr(img_loss)
 
                 # Add MSE loss for coarse-grained model
-                # if 'rgb0' in extras:
-                #     if args.sigma_threshold > 0.:
-                #         img_loss0 = rnh.img2mse(tf.gather_nd(extras['rgb0'], threshold_mask), tf.gather_nd(target_s, threshold_mask))
-                #     else:
-                #         img_loss0 = rnh.img2mse(extras['rgb0'], target_s)
-                #
-                #     loss += img_loss0
+                if 'rgb0' in extras:
+                    if args.sigma_threshold > 0.:
+                        img_loss0 = rnh.img2mse(tf.gather_nd(extras['rgb0'], threshold_mask), tf.gather_nd(target_s, threshold_mask))
+                    else:
+                        img_loss0 = rnh.img2mse(extras['rgb0'], target_s)
+
+                    # loss += img_loss0
 
             gradients = tape.gradient(loss, grad_vars)
             optimizer.apply_gradients(zip(gradients, grad_vars))
             T = np.squeeze(MODELS.rotations.np_rotation_9d_flat_to_transformation_matrix(grad_vars[0].numpy())).astype(np.float32)
             pcd_distance = pcd.get_distance_to_transformation(T, test_T)
 
-            img_loss_list.append(img_loss.numpy())
-            depth_loss_list.append(depth_loss.numpy())
+            if type(img_loss) == tf.python.ops.EagerTensor:
+                img_loss = img_loss.numpy()
+
+            if type(depth_loss) == tf.python.ops.EagerTensor:
+                depth_loss = depth_loss.numpy()
+
+            img_loss_list.append(img_loss)
+            depth_loss_list.append(depth_loss)
             pcd_list.append(pcd_distance)
 
             # print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss.numpy():1f} depth loss: {depth_loss.numpy():1f} pcd: {pcd_distance}m')
             print(
-                f'epoch: {epoch + 1}/{epochs} batch: {i_batch + 1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss.numpy():1f} pcd: {pcd_distance}m')
-            if loss.numpy() < loss_min[0]:
+                f'epoch: {epoch + 1}/{epochs} batch: {i_batch + 1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss:1f} pcd: {pcd_distance}m')
+            if loss < loss_min[0]:
                 loss_min = (loss.numpy(), pcd_distance)
 
-            if img_loss.numpy() < img_loss_min[0]:
-                img_loss_min = (img_loss.numpy(), pcd_distance)
+            if img_loss < img_loss_min[0]:
+                img_loss_min = (img_loss, pcd_distance)
 
             # if depth_loss.numpy() < depth_loss_min[0]:
             #     depth_loss_min = (depth_loss.numpy(), pcd_distance)
@@ -263,7 +307,7 @@ def optimize_model_to_single_image(args,
                                                threshold_mask,
                                                initial_transformation)
                 imageio.imwrite(f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{str(epoch * 100 + i_batch).zfill(4)}.png', (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
-
+    # plot_loss_pcd(img_loss_list, pcd_list)
     results = {'img_loss_min': img_loss_list, 'depth_loss_min': depth_loss_list, 'pcd': pcd_list}
     return T, results
 
@@ -488,6 +532,12 @@ def downsample_image(image, down):
         return image
 
 
+def upsample_image(image, up):
+    bigger_H, bigger_W = image.shape[0] * int(up), image.shape[1] * int(up)
+    upsampled_image = tf.image.resize(np.expand_dims(image, axis=0), [bigger_H, bigger_W], ).numpy()
+    return upsampled_image[0]
+
+
 def test_perturbation_range(args, images, poses, depth_images, K):
     for test_pose in poses:
         for x_deg in [0., 1., 2., 4., 8.]:
@@ -550,15 +600,16 @@ def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, tes
     render_kwargs_test.update(bds_dict)
     # pprint.pprint(render_kwargs_test)
     predicted_c2w, results = optimize_model_to_single_image(args,
-                                                   test_image,
-                                                   render_kwargs_test,
-                                                   [args.c2w],
-                                                   test_pose,
-                                                   epochs=args.epochs,
-                                                   image_mask=test_mask,
-                                                   test_depth_image=test_depth_image,
-                                                   K=K,
-                                                            pcd=pcd)
+                                                            test_image,
+                                                            render_kwargs_test,
+                                                            [args.c2w],
+                                                            test_pose,
+                                                            epochs=args.epochs,
+                                                            image_mask=test_mask,
+                                                            test_depth_image=test_depth_image,
+                                                            K=K,
+                                                            pcd=pcd,
+                                                            resample=args.up_down_sample)
 
     return predicted_c2w, results
 
@@ -730,7 +781,9 @@ if __name__ == '__main__':
             args.testskip,
             args.image_extn,
             mask_directory=args.mask_directory,
-            get_depths=args.get_depth_maps)
+            get_depths=args.get_depth_maps,
+            image_field=args.image_fieldname,
+            image_dir_override=args.image_dir_override)
 
         i_train, i_val, i_tests = i_split
 
@@ -779,7 +832,7 @@ if __name__ == '__main__':
             print(f'file ({output_filename}) already exists, skipping: {os.path.isfile(output_filename)}')
             continue
 
-        test_image = images[i_test]
+        test_image = images[i_test, ..., :3]
 
         if args.mask_directory is not None:
             test_mask = masks[i]
@@ -846,6 +899,9 @@ if __name__ == '__main__':
               f'GTvsBB8: {gt_to_bb8:.2g} ')
 
         import pickle
+        if not os.path.isdir(args.output_directory):
+            os.mkdir(args.output_directory)
+
         output = open(os.path.join(args.output_directory, f'results_dict_{str(frame_number).zfill(4)}.pkl'), 'wb')
         pickle.dump(overall_results, output)
         output.close()

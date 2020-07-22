@@ -675,6 +675,10 @@ def config_parser():
 
     parser.add_argument("--use_huber_loss", action='store_true', help='use_huber_loss')
 
+    parser.add_argument("--image_dir_override", type=str, default=None, help='image_dir_override')
+
+    parser.add_argument("--up_down_sample", type=float, default=1.0, help='up_down_sample')
+
     return parser
 
 
@@ -736,7 +740,8 @@ def train():
             args.image_extn,
             mask_directory=args.mask_directory,
             get_depths=args.get_depth_maps,
-            image_field=args.image_fieldname)
+            image_field=args.image_fieldname,
+            image_dir_override=args.image_dir_override)
 
         if args.mask_directory is not None:
             masks = extras['masks']

@@ -26,13 +26,16 @@ if __name__ == '__main__':
             args.testskip,
             args.image_extn,
             mask_directory=args.mask_directory,
-            get_depths=args.get_depth_maps)
+            get_depths=args.get_depth_maps,
+            image_field=args.image_fieldname,
+            image_dir_override=args.image_dir_override)
 
         i_train, i_val, i_tests = i_split
 
 pcds = []
 # test examples x batches x (loss+pcd)
-results = np.zeros(shape=(len(i_tests), 87, 2), dtype=np.float32)
+
+results = np.zeros(shape=(len(i_tests)), dtype=np.float32)
 for i, i_test in enumerate(i_tests):
     filename = extras['filenames'][2][i]
     frame_number = int(re.findall(r'\d+', filename)[-1])
@@ -43,9 +46,9 @@ for i, i_test in enumerate(i_tests):
 
     input = open(output_filename, 'rb')
     overall_results = pickle.load(input)
-    results[i, :, 0] = overall_results[filename]['img_loss_min']
-    results[i, :, 1] = overall_results[filename]['pcd']
+    # results[i, :, 0] = overall_results[filename]['img_loss_min']
+    results[i] = overall_results[filename]['pcd'][-1]
     input.close()
 
-pcds = np.stack(pcds)
-print(f'ADD measure: {np.sum(pcds < 0.1 * 0.259425) / pcds.shape[0]}')
+# pcds = np.stack(pcds)
+print(f'ADD measure: {np.sum(results < 0.1 * 0.259425) / results.shape[0]}')

@@ -50,7 +50,7 @@ def linemod_dpt(path):
     return (np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols)) / 1000.).astype(np.float32)
 
 
-def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None, image_field='file_path'):
+def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None, image_field='file_path', image_dir_override=None):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -78,6 +78,9 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
                 image_filename = os.path.join(basedir, frame[image_field])
             else:
                 image_filename = os.path.join(basedir, frame[image_field] + image_extn)
+
+            if image_dir_override is not None:
+                image_filename = os.path.join(image_dir_override, os.path.basename(image_filename))
 
             assert os.path.isfile(image_filename), f'fname not found at: {image_filename}'
             filenames.append(image_filename)

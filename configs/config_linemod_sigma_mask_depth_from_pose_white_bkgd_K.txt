@@ -1,4 +1,4 @@
-expname = driller_linemod_sigma_mask_depth_from_pose_white_bkgd_K_test
+expname = driller_linemod_sigma_mask_depth_from_pose_white_bkgd_K
 basedir = ./logs
 datadir = /home/adam/shared/LINEMOD/nerf/driller
 dataset_type = blender

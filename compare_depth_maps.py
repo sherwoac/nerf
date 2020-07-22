@@ -36,9 +36,6 @@ def render_depth(args, T, H, W, focal):
     return extras_network
 
 
-
-
-
 def load_linemod_depth_images(base_directory, depth_directory):
     list_of_image_filenames = load_llff.get_list_of_image_filenames(base_directory)
     depth_images = []
