@@ -167,26 +167,25 @@ def optimize_model_to_single_image(args,
                                    grad_vars,
                                    test_T,
                                    epochs=100,
-                                   resample=1., # downsample > 1 > upsample - eg. factor of increasing size
+                                   resample_factor=1.,  # downsample > 1 > upsample - eg. factor of increasing size
                                    image_mask=None,
                                    test_depth_image=None,
                                    K=None,
                                    pcd=None):
-    H, W, focal = int(test_image.shape[0]*resample), int(test_image.shape[1]*resample), 584.*resample
+    H_resampled, W_resampled, focal = int(test_image.shape[0] * resample_factor), int(test_image.shape[1] * resample_factor), 584. * resample_factor
     optimizer = tf.keras.optimizers.Adam(args.lrate)
     identity_transformation = np.eye(4, dtype=np.float32)[:3, :4] # identity pose matrix
     img_loss_list = []
     depth_loss_list = []
     pcd_list = []
 
-    if resample < 1.:
+    if resample_factor != 1.:
         # downsample
-        sampled_image = downsample_image(np.copy(test_image), down)
-    elif resample > 1.:
-        # upsample
-        sampled_image = upsample_image(np.copy(test_image), 1 / down)
+        sampled_image = resample_image(np.copy(test_image), resample_factor)
+        sampled_depth_image = resample_image(np.copy(test_depth_image)[..., np.newaxis], resample_factor)[..., 0]
     else:
         sampled_image = np.copy(test_image)
+        sampled_depth_image = np.copy(test_depth_image)
 
 
     loss_min = (float("inf"), )
@@ -196,16 +195,16 @@ def optimize_model_to_single_image(args,
 
     for epoch in range(epochs):
         up_mask = find_rough_mask(args, render_kwargs, test_image, 16, K)
-        ret = create_ray_batches(H,
-                                 W,
+        ret = create_ray_batches(H_resampled,
+                                 W_resampled,
                                  focal,
                                  np.expand_dims(sampled_image, axis=0),
                                  np.expand_dims(identity_transformation, axis=0),
                                  seed=epoch,
                                  shuffle=True,
                                  masks=np.expand_dims(image_mask, axis=0) if image_mask is not None else None,
-                                 depth_images=np.expand_dims(test_depth_image, axis=0) if test_depth_image is not None else None,
-                                 K=K)
+                                 depth_images=np.expand_dims(sampled_depth_image, axis=0) if test_depth_image is not None else None,
+                                 K=K * resample_factor)
 
         rays_rgb = ret[0]
         rays_rgb = rays_rgb[up_mask]
@@ -237,7 +236,7 @@ def optimize_model_to_single_image(args,
                 batch_rays, target_s = batch[:2], batch[2]
 
                 rgb, disp, acc, extras = rn.render(
-                    H, W, focal, rays=batch_rays, retraw=True, **render_kwargs)
+                    H_resampled, W_resampled, focal, rays=batch_rays, retraw=True, **render_kwargs)
 
                 # Compute MSE loss between predicted and true RGB.
                 # depth_loss = tf.constant(value=0., shape=0, dtype=tf.float32)
@@ -288,7 +287,7 @@ def optimize_model_to_single_image(args,
 
             # print(f'epoch: {epoch+1}/{epochs} batch: {i_batch+1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss.numpy():1f} depth loss: {depth_loss.numpy():1f} pcd: {pcd_distance}m')
             print(
-                f'epoch: {epoch + 1}/{epochs} batch: {i_batch + 1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss:1f} pcd: {pcd_distance}m')
+                f'epoch: {epoch + 1}/{epochs} batch: {i_batch + 1}/{number_of_batches} loss: {loss:1f} img_loss: {img_loss:1f} depth_loss: {depth_loss:.2g} pcd: {pcd_distance}m')
             if loss < loss_min[0]:
                 loss_min = (loss.numpy(), pcd_distance)
 
@@ -522,14 +521,11 @@ def show_test_images_at_c2w(Ts, test_image, render_kwargs, titles=[]):
     plt.show()
 
 
-def downsample_image(image, down):
+def resample_image(image, down):
     import tensorflow as tf
-    H, W = image.shape[0], image.shape[1]
-    if down > 1:
-        downsampled_image = tf.image.resize(np.expand_dims(image, axis=0), [H // down, W // down]).numpy()
-        return downsampled_image[0]
-    else:
-        return image
+    H, W = int(image.shape[0] * down), int(image.shape[1] * down)
+    downsampled_image = tf.image.resize(np.expand_dims(image, axis=0), [H, W]).numpy()
+    return downsampled_image[0]
 
 
 def upsample_image(image, up):
@@ -609,7 +605,7 @@ def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, tes
                                                             test_depth_image=test_depth_image,
                                                             K=K,
                                                             pcd=pcd,
-                                                            resample=args.up_down_sample)
+                                                            resample_factor=args.up_down_sample)
 
     return predicted_c2w, results
 
