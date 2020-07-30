@@ -677,7 +677,9 @@ def config_parser():
 
     parser.add_argument("--image_dir_override", type=str, default=None, help='image_dir_override')
 
-    parser.add_argument("--up_down_sample", type=float, default=1.0, help='up_down_sample')
+    parser.add_argument("--resample", type=float, default=1.0, help='resample')
+
+    parser.add_argument("--object_radius", type=float, default=0.259425, help='object_radius default driller: 0.259425')
 
     return parser
 

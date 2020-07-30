@@ -163,7 +163,17 @@ class LinemodLoader(object):
     linemod_orig_dir = '/home/adam/shared/LINEMOD_ORIG'
     linemod_dataset_dir = '/home/adam/shared/LINEMOD'
     render_sub_dir = os.path.join(linemod_dataset_dir, 'renders_linemod')
-    linemod_objects = ['driller']
+    linemod_objects = ['ape',
+                       # 'benchvise',
+                       'can',
+                       'cat',
+                       'eggbox',
+                       'glue',
+                       'holepuncher',
+                       # 'iron',
+                       # 'lamp',
+                       'duck',
+                       'driller']
     dataset_names = ['train', 'test', 'val', 'all']
     down_sample_mini = 5
     def __init__(self):
@@ -307,7 +317,7 @@ class LinemodLoader(object):
 if __name__ == '__main__':
     tf.compat.v1.enable_eager_execution()
     lml = LinemodLoader()
-    lml.make_jsons()
+    # lml.make_jsons()
     # lml.make_mini(102)
-    lml.make_mini_all()
+    # lml.make_mini_all()
     lml.make_centring_transformations()

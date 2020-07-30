@@ -42,7 +42,8 @@ for i, i_test in enumerate(i_tests):
     output_filename = os.path.join(args.output_directory, f'results_dict_{str(frame_number).zfill(4)}.pkl')
     if not os.path.isfile(output_filename):
         print(f'missing results at: {output_filename}')
-        exit(1)
+        # exit(1)
+        break
 
     input = open(output_filename, 'rb')
     overall_results = pickle.load(input)

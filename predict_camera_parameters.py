@@ -125,27 +125,20 @@ def create_masked_ray_batches(H, W, focal, ray_mask, images, poses, i_train=[0],
         # masks, rays = rn.unison_shuffled_copies(ravelled_masks, rays_rgb)
 
 
-def find_rough_mask(args, render_kwargs, test_image, down, K):
-    H, W = test_image.shape[:2]
-    H_down, W_down, K_down = test_image.shape[0] // down, test_image.shape[1] // down, K / down
+def find_rough_mask(args, render_kwargs, original_image, output_image, down, K):
+    H, W = output_image.shape[:2]
+    H_down, W_down, K_down = original_image.shape[0] // down, original_image.shape[1] // down, K / down
     rays = rn.get_rays_np_K(H_down, W_down, K_down, c2w=np.eye(4, dtype=np.float32)[:3, :4])
     _, _, acc, _ = rn.render(H_down, W_down, focal=-1.0, rays=rays, **render_kwargs)
     threshold_full_mask = tf.where(acc > args.sigma_threshold,
                                    tf.ones(shape=acc.shape[:2]),
                                    tf.zeros(shape=acc.shape[:2]))
-
     dilated_threshold_mask = scipy.ndimage.binary_dilation(threshold_full_mask.numpy()).astype(threshold_full_mask.numpy().dtype)
     resized_threshold_mask = np.squeeze(tf.image.resize(np.expand_dims(dilated_threshold_mask, axis=-1), (H, W)).numpy())
     return np.where(resized_threshold_mask.astype(np.bool).ravel())
 
 
 def plot_loss_pcd(loss_list, pcd_list, threshold=0.025):
-    # plt.plot(loss_list, label='loss')
-    # plt.plot(pcd_list, label='pcd')
-    # plt.axhline(y=threshold, color='r', linestyle='-')
-    # plt.legend()
-    # plt.show()
-
     fig = plt.figure()
     ax = fig.add_subplot(111)
     ln1 = ax.plot(loss_list, color='blue', label='loss')
@@ -194,7 +187,9 @@ def optimize_model_to_single_image(args,
     initial_transformation = np.copy(grad_vars[0].numpy())
 
     for epoch in range(epochs):
-        up_mask = find_rough_mask(args, render_kwargs, test_image, 16, K)
+        up_mask = find_rough_mask(args, render_kwargs, test_image, sampled_image, 16, K)
+        up_mask_2d = np.zeros(shape=(H_resampled, W_resampled)).astype(np.bool)
+        up_mask_2d[np.unravel_index(up_mask, shape=(H_resampled, W_resampled))] = True
         ret = create_ray_batches(H_resampled,
                                  W_resampled,
                                  focal,
@@ -207,7 +202,8 @@ def optimize_model_to_single_image(args,
                                  K=K * resample_factor)
 
         rays_rgb = ret[0]
-        rays_rgb = rays_rgb[up_mask]
+        rays_rgb = rays_rgb[up_mask].copy()
+
         if image_mask is not None:
             masks = ret[1]
             masks = masks[up_mask]
@@ -216,7 +212,7 @@ def optimize_model_to_single_image(args,
             depths = ret[-1]
             depths = depths[up_mask]
 
-        # shuffled_coordinates = ret[-2]
+        shuffled_coordinates = ret[-2]
 
         number_of_batches = max(rays_rgb.shape[0] // args.N_rand, 1)
         for i_batch in range(number_of_batches):
@@ -298,14 +294,16 @@ def optimize_model_to_single_image(args,
             #     depth_loss_min = (depth_loss.numpy(), pcd_distance)
 
             if args.visualize_optimization:
-                tiled = output_interim_results(test_image,
+                tiled = output_interim_results(sampled_image,
                                                render_kwargs,
-                                               test_depth_image,
+                                               sampled_depth_image,
                                                image_mask,
                                                batch_indices,
                                                threshold_mask,
-                                               initial_transformation)
-                imageio.imwrite(f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{str(epoch * 100 + i_batch).zfill(4)}.png', (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
+                                               shuffled_coordinates)
+                image_filename = f'/home/adam/CODE/nerf/logs/camera_optimize/tiled_{str(epoch * 100 + i_batch).zfill(4)}.png'
+                imageio.imwrite(image_filename, (255. * np.clip(tiled, 0., 1.)).astype(np.uint8))
+                print(f'written: {image_filename}')
     # plot_loss_pcd(img_loss_list, pcd_list)
     results = {'img_loss_min': img_loss_list, 'depth_loss_min': depth_loss_list, 'pcd': pcd_list}
     return T, results
@@ -317,8 +315,12 @@ def output_interim_results(test_image,
                            image_mask,
                            batch_indices,
                            threshold_mask,
-                           initial_transformation):
+                           shuffled_coordinates):
     H, W = test_image.shape[:2]
+    red = np.array([1., 0., 0.])
+    green = np.array([0., 1., 0.])
+    if image_mask is None:
+        image_mask = np.ones(shape=(H, W)).astype(np.bool)
     rgb, disp, acc, extras = rn.render(H, W, 1.0, c2w=np.eye(4, dtype=np.float32)[:3, :4], **render_kwargs)
     threshold_full_mask = tf.where(acc > args.sigma_threshold, tf.ones(shape=rgb.shape[:2]),
                                    tf.zeros(shape=rgb.shape[:2]))
@@ -336,20 +338,22 @@ def output_interim_results(test_image,
     in_object_batch_shuffle_mask.ravel()[shuffled_coordinates[batch_indices][threshold_mask]] = True
     # show_batch_image = np.copy(rgb.numpy())
     # show_batch_image[batch_shuffle_mask] = 1
-    test_depth_image_norm = get_mpl_array_plot(get_array_norm(test_depth_image))
-    test_depth_image_norm[threshold_full_mask.numpy().astype(np.bool)] = np.array([1., 0., 0.])
+    # test_depth_image_norm = get_mpl_array_plot(get_array_norm(test_depth_image))
+    test_depth_image_norm = get_array_norm(test_depth_image)
+    test_depth_image_norm = make_rgb(test_depth_image_norm)
+    test_depth_image_norm[threshold_full_mask.numpy().astype(np.bool)] = red
 
     test_image_output = np.copy(test_image)
-    test_image_output[batch_shuffle_mask] = np.array([1., 0., 0.])
-    test_image_output[in_object_batch_shuffle_mask] = np.array([0., 1., 0.])
+    test_image_output[batch_shuffle_mask] = red
+    test_image_output[in_object_batch_shuffle_mask] = green
 
-    rgb_thresholded[batch_shuffle_mask] = np.array([1., 0., 0.])
-    rgb_thresholded[in_object_batch_shuffle_mask] = np.array([0., 1., 0.])
+    rgb_thresholded[batch_shuffle_mask] = red
+    rgb_thresholded[in_object_batch_shuffle_mask] = green
     tiled = OUTPUT.image_tools.tile_images(
         np.array(
-            [[make_rgb(acc), test_image_output, get_mpl_array_plot(depth3), test_depth_image_norm],
-             [overlap, rgb_thresholded, get_mpl_array_plot(depth_th3),
-              get_mpl_array_plot(depth_thresholded - thresholded_gt_depth)]]
+            [[make_rgb(acc), test_image_output, make_rgb(depth3), test_depth_image_norm],
+             [overlap, rgb_thresholded, make_rgb(depth_th3),
+              make_rgb(depth_thresholded - thresholded_gt_depth)]]
         ),
     )
     return tiled
@@ -605,7 +609,7 @@ def train_on_one_image(args, test_image, initial_pose, test_pose, test_mask, tes
                                                             test_depth_image=test_depth_image,
                                                             K=K,
                                                             pcd=pcd,
-                                                            resample_factor=args.up_down_sample)
+                                                            resample_factor=args.resample)
 
     return predicted_c2w, results
 
@@ -817,10 +821,10 @@ if __name__ == '__main__':
         object_name = get_object_name_from_filename(df['filename'].iloc[0])
         centring_transformation = centring_transforms_dict[object_name]
 
-    overall_results = {}
     predicted_poses = []
     test_to_initial_pcd_distances = []
     for i, i_test in enumerate(i_tests):
+        overall_results = {}
         filename = extras['filenames'][2][i]
         frame_number = int(re.findall(r'\d+', filename)[-1])
         output_filename = os.path.join(args.output_directory, f'results_dict_{str(frame_number).zfill(4)}.pkl')
@@ -840,7 +844,12 @@ if __name__ == '__main__':
         else:
             test_depth_image = None
 
-        bb8_pose = approximate_pose_dict[frame_number]
+        if frame_number in approximate_pose_dict:
+            bb8_pose = approximate_pose_dict[frame_number]
+        else:
+            print(f'frame_number: {frame_number} not in approximate_pose_dict for filename: {filename}')
+            exit(0)
+
         gt_pose = poses[i_test]
         predicted_c2w, results = train_on_one_image(args, test_image, bb8_pose, gt_pose, test_mask, test_depth_image, K, pcd_distance)
         if args.visualize_results:
@@ -903,7 +912,7 @@ if __name__ == '__main__':
         output.close()
 
     test_to_initial_pcd_distances = np.stack(test_to_initial_pcd_distances)
-    print(f'ADD measure: {np.sum(test_to_initial_pcd_distances < 0.1 * 0.259425) / test_to_initial_pcd_distances.shape[0]}')
+    print(f'ADD measure: {np.sum(test_to_initial_pcd_distances < 0.1 * args.object_radius) / test_to_initial_pcd_distances.shape[0]}')
 
     # import pickle
     # output = open('overall_results.pkl', 'wb')
