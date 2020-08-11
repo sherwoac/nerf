@@ -1,6 +1,6 @@
-expname = driller_linemod_sigma_mask_depth_from_pose_white_bkgd_K
+expname = duck_linemod_sigma_mask_depth_from_pose_white_bkgd_K
 basedir = ./logs
-datadir = /home/adam/shared/LINEMOD/nerf/driller
+datadir = /home/adam/shared/LINEMOD/nerf/duck
 centring_transforms = /home/adam/shared/LINEMOD/nerf/centring_transforms.json
 dataset_type = blender
 get_depth_maps = True
@@ -18,7 +18,7 @@ Z_limits_from_pose = True
 # visualize_optimization = False
 use_K = True
 white_bkgd = True
-approximate_poses_filename = /home/adam/DATA/OUTPUT/SH/test_images/duck_test_results.h5
+approximate_poses_filename = /home/adam/DATA/OUTPUT/LINEMOD_BB8_RESULTS/duck_results.h5
 testskip = 1
 img_loss_threshold = 0.002
 depth_loss_threshold = 0.005

@@ -815,7 +815,9 @@ if __name__ == '__main__':
     if args.approximate_poses_filename:
         approximate_pose_dict = load_approximate_poses(args.approximate_poses_filename, centring_transforms_dict)
         df = dl.open_dataframe(args.approximate_poses_filename)
+
         transformation_pcd_function = lambda T: transformation_from_nerf_sense(T, centring_transformation)
+        print(f"loading file: {df['shape_filename'].iloc[0]}")
         pcd_distance = MODELS.open3d_point_cloud_distance.PointCloudDistance(df['shape_filename'].iloc[0],
                                                                              transformation_function=transformation_pcd_function)
         object_name = get_object_name_from_filename(df['filename'].iloc[0])
