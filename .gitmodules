@@ -1,0 +1,12 @@
+[submodule "NERFCO"]
+	path = NERFCO
+	url = https://github.com/sherwoac/NERFCO
+[submodule "MODELS"]
+	path = MODELS
+	url = https://github.com/sherwoac/MODELS
+[submodule "LOADER"]
+	path = LOADER
+	url = https://github.com/sherwoac/LOADER
+[submodule "OUTPUT"]
+	path = OUTPUT
+	url = https://github.com/sherwoac/OUTPUT
