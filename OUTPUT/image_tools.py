@@ -64,3 +64,7 @@ def tile_images(np_array_of_arrays):
             output_image[row_number * row_image.shape[0]: (row_number + 1) * row_image.shape[0], :, :] = row_image
 
     return output_image
+
+
+def make_rgb(single_channel_image):
+    return np.concatenate([single_channel_image[:, :, np.newaxis], single_channel_image[:, :, np.newaxis], single_channel_image[:, :, np.newaxis]], axis=-1)
