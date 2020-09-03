@@ -1,5 +1,5 @@
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-
+from collections import defaultdict
 import time
 
 from args_and_config import config_parser
@@ -8,6 +8,7 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 import MODELS.tf_rotations
+from NERFCO.nerf_keypoint_network import init_nerf_model_with_categories
 
 
 def batchify(fn, chunk):
@@ -143,6 +144,7 @@ def render_rays(ray_batch,
 
         Args:
           raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+          # RGB [0, 1] alpha [0, 1], + categories
           z_vals: [num_rays, num_samples along ray]. Integration time.
           rays_d: [num_rays, 3]. Direction of each ray.
 
@@ -273,10 +275,16 @@ def render_rays(ray_batch,
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
+        if raw.shape[-1] > 4:
+            raw = raw[..., :3] # RGBalpha only
+
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
 
     ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'depth_map': depth_map}
+    if raw.shape[-1] > 4:
+        ret['categories'] = raw[..., 4:] # categories only
+
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -286,6 +294,7 @@ def render_rays(ray_batch,
         ret['depth_map'] = depth_map_0
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
 
+
     for k in ret:
         tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
 
@@ -294,13 +303,11 @@ def render_rays(ray_batch,
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
-    all_ret = {}
+    all_ret = defaultdict(list)
     for i in range(0, rays_flat.shape[0], chunk):
         # print(f'i:{i} / {rays_flat.shape[0]}')
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
-        for k in ret:
-            if k not in all_ret:
-                all_ret[k] = []
+        for k in ret.keys():
             all_ret[k].append(ret[k])
 
     all_ret = {k: tf.concat(all_ret[k], 0) for k in all_ret}
@@ -441,10 +448,19 @@ def create_nerf(args):
             args.multires_views, args.i_embed)
     output_ch = 4
     skips = [4]
-    model = init_nerf_model(
-        D=args.netdepth, W=args.netwidth,
-        input_ch=input_ch, output_ch=output_ch, skips=skips,
-        input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+    if args.number_of_keypoints > 0:
+        model = init_nerf_model_with_categories(
+            D=args.netdepth, W=args.netwidth,
+            input_ch=input_ch, output_ch=output_ch, skips=skips,
+            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+            number_of_categories=args.number_of_keypoints)
+    else:
+        model = init_nerf_model(
+            D=args.netdepth, W=args.netwidth,
+            input_ch=input_ch, output_ch=output_ch, skips=skips,
+            input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+
+
     grad_vars = model.trainable_variables
     models = {'model': model}
 
@@ -633,11 +649,39 @@ def train():
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
 
-
     if args.mask_directory and not args.white_bkgd:
         assert os.path.isdir(args.mask_directory), f'args.mask_directory not found at: {args.mask_directory}'
         if args.mask_images:
             images *= masks[..., np.newaxis]
+
+    if args.colmap_keypoints_filename is not None:
+        import pickle
+        import re
+        colmap_keypoints_file = open(args.colmap_keypoints_filename, 'rb')
+        keypoint_info_dict = pickle.load(colmap_keypoints_file)
+        frame_number_to_keypoints = keypoint_info_dict['keypoints_per_image']
+        keypoints_to_reference = keypoint_info_dict['keypoints_to_references']
+
+        args.number_of_keypoints = len(keypoints_to_reference.keys()) + 1 # + 1 for no keypoint at this XYZ
+        all_filenames = extras['filenames'][0] + extras['filenames'][1] + extras['filenames'][2]
+        images_keypoints = np.zeros(shape=(len(all_filenames), 480, 640), dtype=np.uint16)
+        frame_number_to_filename_offset = {}
+        for i_filename_offset, filename in enumerate(all_filenames):
+            frame_number = int(re.findall(r'\d+', filename)[-1])
+            frame_number_to_filename_offset[frame_number] = i_filename_offset
+
+        keypoint_masks = np.zeros(shape=[len(all_filenames), 480, 640], dtype=np.uint16)
+        key_number_to_reference_keypoint = {}
+        for i_keypoint_number, (reference_keypoint, alias_keypoint_list) in enumerate(keypoints_to_reference.items()):
+            key_number_to_reference_keypoint[i_keypoint_number] = reference_keypoint
+            for alias_keypoint in alias_keypoint_list:
+                frame_number, X, Y = alias_keypoint
+                if frame_number in frame_number_to_filename_offset:
+                    images_keypoints[frame_number_to_filename_offset[frame_number], Y, X] = i_keypoint_number
+
+
+    # TODO: integrate the new masks into the input and output training data
+    # TODO: make the crossentropy loss encode the integer in the mask to one hot.
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -751,7 +795,10 @@ def train():
         rays_rgb = rays_rgb.astype(np.float32)
         print('shuffle rays')
         if args.mask_directory and args.sigma_masking:
-            rays_rgb, pixel_train_masks = unison_shuffled_copies([rays_rgb, pixel_train_masks])
+            if args.colmap_keypoints_filename is not None:
+                rays_rgb, pixel_train_masks, keypoint_masks = unison_shuffled_copies([rays_rgb, pixel_train_masks, keypoint_masks])
+            else:
+                rays_rgb, pixel_train_masks = unison_shuffled_copies([rays_rgb, pixel_train_masks])
         else:
             np.random.shuffle(rays_rgb)
         print('done')
@@ -831,7 +878,6 @@ def train():
             rgb, disp, acc, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
-
             # Compute MSE loss between predicted and true RGB.
             if args.sigma_masking:
                 loss = photometric_loss_function(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
@@ -840,6 +886,12 @@ def train():
 
             if args.force_black_background:
                 loss += 0.1 * photometric_loss_function(rgb[~in_mask_pixels_batch], 0.)
+
+            if args.categories > 0:
+                network_output_categories = extras['catergories']
+                loss += tf.keras.losses.binary_crossentropy(y_true=rgb[..., args.categories:],
+                                                            y_pred=network_output_categories)
+
 
             trans = extras['raw'][..., -1]
             psnr = mse2psnr(loss)

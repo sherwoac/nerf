@@ -5,7 +5,7 @@ import imageio
 import json
 
 from load_llff import load_masks
-from create_linemod_data import linemod_camera_intrinsics
+from NERFCO.create_linemod_data import linemod_camera_intrinsics
 
 
 trans_t = lambda t : tf.convert_to_tensor([

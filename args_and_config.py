@@ -160,4 +160,7 @@ def config_parser():
 
     parser.add_argument("--colmap_db_filename", type=str, default='./data/linemod_driller_all_llff/database.db', help='location of colmap db')
 
+    parser.add_argument("--colmap_keypoints_filename", type=str, default=None, help='location of colmap keypoints pkl')
+
+    parser.add_argument("--number_of_keypoints", type=int, default=None, help='number of unique keypoints')
     return parser
