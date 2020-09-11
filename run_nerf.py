@@ -175,6 +175,12 @@ def render_rays(ray_batch,
         # Extract RGB of each sample position along each ray.
         rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
 
+        categories = None
+        if raw.shape[-1] > 4:
+            # Extract keypoints of each sample position along each ray.
+            categories = tf.math.sigmoid(raw[..., 4:])  # [N_rays, N_samples, 3]
+
+
         # Add noise to model's predictions for density. Can be used to
         # regularize network during training (prevents floater artifacts).
         noise = 0.
@@ -209,6 +215,10 @@ def render_rays(ray_batch,
         # To composite onto a white background, use the accumulated alpha map.
         if white_bkgd:
             rgb_map = rgb_map + (1.-acc_map[..., None])
+
+        if categories is not None:
+            keypoints_map = tf.reduce_sum(weights[..., None] * categories, axis=-2)  # [N_rays, embedding_size]
+            return rgb_map, disp_map, acc_map, weights, depth_map, keypoints_map
 
         return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -275,15 +285,18 @@ def render_rays(ray_batch,
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
+        categories_map = None
         if raw.shape[-1] > 4:
-            raw = raw[..., :4] # RGBalpha only
+            rgb_map, disp_map, acc_map, weights, depth_map, categories_map = \
+                raw2outputs(raw, z_vals, rays_d)
+        else:
+            rgb_map, disp_map, acc_map, weights, depth_map = \
+                raw2outputs(raw, z_vals, rays_d)
 
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-            raw, z_vals, rays_d)
 
     ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'depth_map': depth_map}
-    if raw.shape[-1] > 4:
-        ret['categories'] = raw[..., 4:] # categories only
+    if categories_map is not None:
+        ret['categories'] = categories_map  # categories only
 
     if retraw:
         ret['raw'] = raw
@@ -459,12 +472,12 @@ def create_nerf(args):
 
     model_fine = None
     if args.N_importance > 0:
-        if args.number_of_keypoints is not None and args.number_of_keypoints > 0:
+        if args.keypoint_embedding_size is not None and args.keypoint_embedding_size > 0:
             model_fine = init_nerf_model_with_categories(
                 D=args.netdepth_fine, W=args.netwidth_fine,
                 input_ch=input_ch, output_ch=output_ch, skips=skips,
                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
-                number_of_categories = args.number_of_keypoints
+                keypoint_embedding_size=args.keypoint_embedding_size
             )
         else:
             model_fine = init_nerf_model(
@@ -688,6 +701,7 @@ def train():
 
     if args.colmap_keypoints_filename is not None:
         from NERFCO.nerf_keypoint_network import get_keypoint_masks
+        from NERFCO.embeddings.keras_example import get_simple_embedding
         filename_splits = extras['filenames']
         train_keypoint_masks, args.number_of_keypoints = \
             get_keypoint_masks(args.colmap_keypoints_filename,
@@ -695,9 +709,9 @@ def train():
                                filename_splits,
                                H, W)
 
-
+        keypoint_embeddings = get_simple_embedding(args.number_of_keypoints + 1, args.keypoint_embedding_size)
     # TODO: integrate the new masks into the input and output training data
-    # TODO: make the crossentropy loss encode the integer in the mask to one hot.
+    # TODO: make the loss for keypoint_embeddings
 
     if args.render_test:
         render_poses = np.array(poses[i_test])
@@ -800,7 +814,6 @@ def train():
             if args.ray_masking:
                 rays_rgb = rays_rgb[np.where(train_masks)]
 
-
         # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
         rays_rgb = rays_rgb.astype(np.float32)
@@ -894,14 +907,14 @@ def train():
                 loss = photometric_loss_function(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
             else:
                 loss = photometric_loss_function(rgb, target_s)
+                print(i_batch, loss)
 
             if args.force_black_background:
                 loss += 0.1 * photometric_loss_function(rgb[~in_mask_pixels_batch], 0.)
 
-            if args.colmap_keypoints_filename is not None:
+            if 'categories' in extras:
                 network_output_categories = extras['categories']
-                loss += tf.keras.losses.binary_crossentropy(y_true=network_output_categories,
-                                                            y_pred=integer_to_one_hot(keypoint_masks_batch))
+                loss += img2mse(network_output_categories, keypoint_embeddings[keypoint_masks_batch])
 
 
             trans = extras['raw'][..., -1]

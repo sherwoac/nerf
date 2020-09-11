@@ -163,4 +163,6 @@ def config_parser():
     parser.add_argument("--colmap_keypoints_filename", type=str, default=None, help='location of colmap keypoints pkl')
 
     parser.add_argument("--number_of_keypoints", type=int, default=None, help='number of unique keypoints')
+
+    parser.add_argument("--keypoint_embedding_size", type=int, default=None, help='keypoint_embedding_size')
     return parser
