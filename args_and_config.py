@@ -165,4 +165,12 @@ def config_parser():
     parser.add_argument("--number_of_keypoints", type=int, default=None, help='number of unique keypoints')
 
     parser.add_argument("--keypoint_embedding_size", type=int, default=None, help='keypoint_embedding_size')
+
+    parser.add_argument("--category_activation", type=str, default=None, help='category_activation')
+
+    parser.add_argument("--keypoint_oversample", action='store_true', help='keypoint_oversample')
+
+    parser.add_argument("--keypoint_iterations_start", type=int, default=0, help='keypoint_iterations_start')
+
+    parser.add_argument("--keypoint_loss_coeff", type=float, default=1.0, help='keypoint_loss_coeff')
     return parser

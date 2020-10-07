@@ -11,7 +11,7 @@ import json
 def img2mse(x, y): return tf.reduce_mean(tf.square(x - y))
 
 
-def mse2psnr(x): return -10.*tf.log(x)/tf.log(10.)
+def mse2psnr(x): return -10.*tf.math.log(x)/tf.math.log(10.)
 
 
 def to8b(x): return (255*np.clip(x, 0, 1)).astype(np.uint8)
@@ -129,20 +129,7 @@ def get_rays(H, W, focal, c2w):
     return rays_o, rays_d
 
 
-def get_rays_K(H, W, K, c2w):
-    """Get ray origins, directions from a pinhole camera."""
-    f_x = K[0, 0]
-    f_y = K[1, 1]
-    c_x = K[0, 2]
-    c_y = K[1, 2]
-    # skew = K[0, 1] # ??
 
-    i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
-                       tf.range(H, dtype=tf.float32), indexing='xy')
-    dirs = tf.stack([(i-c_x)/f_x, -(j-c_y)/f_y, -tf.ones_like(i)], -1)
-    rays_d = tf.reduce_sum(dirs[..., tf.newaxis, :] * c2w[:3, :3], -1)
-    rays_o = tf.broadcast_to(c2w[:3, -1], tf.shape(rays_d))
-    return rays_o, rays_d
 
 
 def get_rays_np(H, W, focal, c2w):
@@ -150,22 +137,6 @@ def get_rays_np(H, W, focal, c2w):
     i, j = np.meshgrid(np.arange(W, dtype=np.float32),
                        np.arange(H, dtype=np.float32), indexing='xy')
     dirs = np.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -np.ones_like(i)], -1)
-    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
-    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
-    return rays_o, rays_d
-
-
-def get_rays_np_K(H, W, K, c2w):
-    """Get ray origins, directions from a pinhole camera."""
-
-    f_x = K[0, 0]
-    f_y = K[1, 1]
-    c_x = K[0, 2]
-    c_y = K[1, 2]
-
-    i, j = np.meshgrid(np.arange(W, dtype=np.float32),
-                       np.arange(H, dtype=np.float32), indexing='xy')
-    dirs = np.stack([(i-c_x)/f_x, -(j-c_y)/f_y, -np.ones_like(i)], -1)
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
     rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
     return rays_o, rays_d

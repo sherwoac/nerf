@@ -1,6 +1,7 @@
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 from collections import defaultdict
 import time
+import copy
 
 from args_and_config import config_parser
 from run_nerf_helpers import *
@@ -8,7 +9,9 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
 import MODELS.tf_rotations
-from NERFCO.nerf_keypoint_network import init_nerf_model_with_categories
+import NERFCO.nerf_keypoint_network
+import MODELS.tf_nearest_neighbours
+import NERFCO.nerf_renderer
 
 
 def batchify(fn, chunk):
@@ -21,305 +24,12 @@ def batchify(fn, chunk):
     return ret
 
 
-def rotate_dirs_by_R(dirs, R):
-    """
-    dirs [n x 3]
-    R [3, 3]
-    return
-    transformed [n x 3]
-    """
-    R = tf.transpose(R)
-    transformed = tf.tensordot(dirs, R, axes=1)
-    return transformed
-
-
-def transpose_rotation_matrix(T):
-    R_transpose = tf.transpose(T[:3, :3])
-    return tf.concat([tf.stack([R_transpose[:3, 0], R_transpose[:3, 1], R_transpose[:3, 2], T[:3, 3]], axis=1), [[0, 0, 0, 1.]]], axis=0)
-
-
-def transform_pts_by_T(pts, T):
-    """
-    pts [n x 3]
-    T [4, 4]
-    return
-    transformed [n x 3]
-    """
-    T_transpose = T
-    # T_inv = tf.linalg.inv(T)
-    pts_plus_one = tf.concat([pts, tf.ones(shape=(pts.shape[0], 1), dtype=tf.float32)], axis=1)
-    # tf.tensordot(dirs, tf.transpose(c2w[:3, :3]), axes=1)
-    transformed_x = tf.transpose(tf.tensordot(T_transpose, tf.transpose(pts_plus_one), axes=1))
-    return transformed_x[:, :3]
-
-
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64, c2w=None):
-    """Prepares inputs and applies network 'fn'."""
-
-    inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
-    if c2w is not None:
-        T = tf.squeeze(MODELS.tf_rotations.label_9d_flat_and_t_to_T(c2w))
-        inputs_flat = transform_pts_by_T(inputs_flat, T)
-
-    embedded = embed_fn(inputs_flat)
-    if viewdirs is not None:
-        if c2w is not None:
-            viewdirs = rotate_dirs_by_R(viewdirs, T[:3, :3])
-            viewdirs /= tf.linalg.norm(viewdirs, axis=-1, keepdims=True)
-        input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
-        input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = tf.concat([embedded, embedded_dirs], -1)
-
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = tf.reshape(outputs_flat, list(
-        inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-    return outputs
-
-
-def run_network_c2w(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64, c2w=None):
-    """Prepares inputs and applies network 'fn'."""
-
-    inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
-
-    embedded = embed_fn(inputs_flat)
-    if viewdirs is not None:
-        input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
-        input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-        embedded_dirs = embeddirs_fn(input_dirs_flat)
-        embedded = tf.concat([embedded, embedded_dirs], -1)
-
-    outputs_flat = batchify(fn, netchunk)(embedded)
-    outputs = tf.reshape(outputs_flat, list(
-        inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-    return outputs
-
-def render_rays(ray_batch,
-                network_fn,
-                network_query_fn,
-                N_samples,
-                retraw=False,
-                lindisp=False,
-                perturb=0.,
-                N_importance=0,
-                network_fine=None,
-                white_bkgd=False,
-                raw_noise_std=0.,
-                verbose=False):
-    """Volumetric rendering.
-
-    Args:
-      ray_batch: array of shape [batch_size, ...]. All information necessary
-        for sampling along a ray, including: ray origin, ray direction, min
-        dist, max dist, and unit-magnitude viewing direction.
-      network_fn: function. Model for predicting RGB and density at each point
-        in space.
-      network_query_fn: function used for passing queries to network_fn.
-      N_samples: int. Number of different times to sample along each ray.
-      retraw: bool. If True, include model's raw, unprocessed predictions.
-      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
-      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
-        random points in time.
-      N_importance: int. Number of additional times to sample along each ray.
-        These samples are only passed to network_fine.
-      network_fine: "fine" network with same spec as network_fn.
-      white_bkgd: bool. If True, assume a white background.
-      raw_noise_std: ...
-      verbose: bool. If True, print more debugging info.
-
-    Returns:
-      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
-      disp_map: [num_rays]. Disparity map. 1 / depth.
-      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
-      raw: [num_rays, num_samples, 4]. Raw predictions from model.
-      rgb0: See rgb_map. Output for coarse model.
-      disp0: See disp_map. Output for coarse model.
-      acc0: See acc_map. Output for coarse model.
-      z_std: [num_rays]. Standard deviation of distances along ray for each
-        sample.
-    """
-
-    def raw2outputs(raw, z_vals, rays_d):
-        """Transforms model's predictions to semantically meaningful values.
-
-        Args:
-          raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-          # RGB [0, 1] alpha [0, 1], + categories
-          z_vals: [num_rays, num_samples along ray]. Integration time.
-          rays_d: [num_rays, 3]. Direction of each ray.
-
-        Returns:
-          rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-          disp_map: [num_rays]. Disparity map. Inverse of depth map.
-          acc_map: [num_rays]. Sum of weights along each ray.
-          weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-          depth_map: [num_rays]. Estimated distance to object.
-        """
-        # Function for computing density from model prediction. This value is
-        # strictly between [0, 1].
-        def raw2alpha(raw, dists, act_fn=tf.nn.relu): return 1.0 - \
-            tf.exp(-act_fn(raw) * dists)
-
-        # Compute 'distance' (in time) between each integration time along a ray.
-        dists = z_vals[..., 1:] - z_vals[..., :-1]
-
-        # The 'distance' from the last integration time is infinity.
-        dists = tf.concat(
-            [dists, tf.broadcast_to([1e10], dists[..., :1].shape)],
-            axis=-1)  # [N_rays, N_samples]
-
-        # Multiply each distance by the norm of its corresponding direction ray
-        # to convert to real world distance (accounts for non-unit directions).
-        dists = dists * tf.linalg.norm(rays_d[..., None, :], axis=-1)
-
-        # Extract RGB of each sample position along each ray.
-        rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
-
-        categories = None
-        if raw.shape[-1] > 4:
-            # Extract keypoints of each sample position along each ray.
-            categories = tf.math.sigmoid(raw[..., 4:])  # [N_rays, N_samples, 3]
-
-
-        # Add noise to model's predictions for density. Can be used to
-        # regularize network during training (prevents floater artifacts).
-        noise = 0.
-        if raw_noise_std > 0.:
-            noise = tf.random.normal(raw[..., 3].shape) * raw_noise_std
-
-        # Predict density of each sample along each ray. Higher values imply
-        # higher likelihood of being absorbed at this point.
-        alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
-
-        # Compute weight for RGB of each sample along each ray.  A cumprod() is
-        # used to express the idea of the ray not having reflected up to this
-        # sample yet.
-        # [N_rays, N_samples]
-        weights = alpha * \
-            tf.math.cumprod(1.-alpha + 1e-10, axis=-1, exclusive=True)
-
-        # Computed weighted color of each sample along each ray.
-        rgb_map = tf.reduce_sum(
-            weights[..., None] * rgb, axis=-2)  # [N_rays, 3]
-
-        # Estimated depth map is expected distance.
-        depth_map = tf.reduce_sum(weights * z_vals, axis=-1)
-
-        # Disparity map is inverse depth.
-        disp_map = 1./tf.maximum(1e-10, depth_map /
-                                 tf.reduce_sum(weights, axis=-1))
-
-        # Sum of weights along each ray. This value is in [0, 1] up to numerical error.
-        acc_map = tf.reduce_sum(weights, -1)
-
-        # To composite onto a white background, use the accumulated alpha map.
-        if white_bkgd:
-            rgb_map = rgb_map + (1.-acc_map[..., None])
-
-        if categories is not None:
-            keypoints_map = tf.reduce_sum(weights[..., None] * categories, axis=-2)  # [N_rays, embedding_size]
-            return rgb_map, disp_map, acc_map, weights, depth_map, keypoints_map
-
-        return rgb_map, disp_map, acc_map, weights, depth_map
-
-    ###############################
-    # batch size
-    N_rays = ray_batch.shape[0]
-
-    # Extract ray origin, direction.
-    rays_o, rays_d = ray_batch[:, 0:3], ray_batch[:, 3:6]  # [N_rays, 3] each
-
-    # Extract unit-normalized viewing direction.
-    viewdirs = ray_batch[:, -3:] if ray_batch.shape[-1] > 8 else None
-
-    # Extract lower, upper bound for ray distance.
-    bounds = tf.reshape(ray_batch[..., 6:8], [-1, 1, 2])
-    near, far = bounds[..., 0], bounds[..., 1]  # [-1,1]
-
-    # Decide where to sample along each ray. Under the logic, all rays will be sampled at
-    # the same times.
-    t_vals = tf.linspace(0., 1., N_samples)
-    if not lindisp:
-        # Space integration times linearly between 'near' and 'far'. Same
-        # integration points will be used for all rays.
-        z_vals = near * (1.-t_vals) + far * (t_vals)
-    else:
-        # Sample linearly in inverse depth (disparity).
-        z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-    z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples])
-
-    # Perturb sampling time along each ray.
-    if perturb > 0.:
-        # get intervals between samples
-        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        upper = tf.concat([mids, z_vals[..., -1:]], -1)
-        lower = tf.concat([z_vals[..., :1], mids], -1)
-        # stratified samples in those intervals
-        t_rand = tf.random.uniform(z_vals.shape)
-        z_vals = lower + (upper - lower) * t_rand
-
-    # Points in space to evaluate model at.
-    pts = rays_o[..., None, :] + rays_d[..., None, :] * \
-        z_vals[..., :, None]  # [N_rays, N_samples, 3]
-
-    # Evaluate model at each point.
-    raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
-        raw, z_vals, rays_d)
-
-    if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0, depth_map_0 = rgb_map, disp_map, acc_map, depth_map
-
-        # Obtain additional integration times to evaluate based on the weights
-        # assigned to colors in the coarse model.
-        z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        z_samples = sample_pdf(
-            z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.))
-        z_samples = tf.stop_gradient(z_samples)
-
-        # Obtain all points to evaluate color, density at.
-        z_vals = tf.sort(tf.concat([z_vals, z_samples], -1), -1)
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * \
-            z_vals[..., :, None]  # [N_rays, N_samples + N_importance, 3]
-
-        # Make predictions with network_fine.
-        run_fn = network_fn if network_fine is None else network_fine
-        raw = network_query_fn(pts, viewdirs, run_fn)
-        categories_map = None
-        if raw.shape[-1] > 4:
-            rgb_map, disp_map, acc_map, weights, depth_map, categories_map = \
-                raw2outputs(raw, z_vals, rays_d)
-        else:
-            rgb_map, disp_map, acc_map, weights, depth_map = \
-                raw2outputs(raw, z_vals, rays_d)
-
-
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'depth_map': depth_map}
-    if categories_map is not None:
-        ret['categories'] = categories_map  # categories only
-
-    if retraw:
-        ret['raw'] = raw
-    if N_importance > 0:
-        ret['rgb0'] = rgb_map_0
-        ret['disp0'] = disp_map_0
-        ret['acc0'] = acc_map_0
-        ret['depth_map'] = depth_map_0
-        ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
-
-
-    for k in ret:
-        tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
-
-    return ret
-
-
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM."""
     all_ret = defaultdict(list)
     for i in range(0, rays_flat.shape[0], chunk):
         # print(f'i:{i} / {rays_flat.shape[0]}')
-        ret = render_rays(rays_flat[i:i+chunk], **kwargs)
+        ret = NERFCO.nerf_renderer.render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret.keys():
             all_ret[k].append(ret[k])
 
@@ -359,14 +69,19 @@ def render(H, W, focal,
 
     if c2w is not None:
         if 'K' in kwargs:
-            rays_o, rays_d = get_rays_K(H, W, kwargs['K'], c2w)
-            del kwargs['K']
+            rays_o, rays_d = NERFCO.nerf_renderer.get_rays_K(H, W, kwargs['K'], c2w)
         else:
             # special case to render full image
             rays_o, rays_d = get_rays(H, W, focal, c2w)
     else:
         # use provided ray batch
         rays_o, rays_d = rays
+
+    # hack for K not an argument of render_rays
+    # TODO: can only be solved with total refactor
+    kwargs_copy = kwargs.copy()
+    if 'K' in kwargs_copy:
+        del kwargs_copy['K']
 
     if use_viewdirs:
         # provide ray directions as input
@@ -399,7 +114,7 @@ def render(H, W, focal,
         rays = tf.concat([rays, viewdirs], axis=-1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, **kwargs_copy)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
@@ -411,7 +126,7 @@ def render(H, W, focal,
 
 
 def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
-
+    from collections import defaultdict
     H, W, focal = hwf
 
     if render_factor != 0:
@@ -421,16 +136,18 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
         focal = focal/render_factor
 
     rgbs = []
-    disps = []
 
     t = time.time()
+    extrass = defaultdict(list)
     for i, c2w in enumerate(render_poses):
         # print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(
+        rgb, disp, acc, extras = render(
             H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
+
+        extras['disp'] = disp.numpy()
+
         rgbs.append(rgb.numpy())
-        disps.append(disp.numpy())
         if i == 0:
             print(rgb.shape, disp.shape)
 
@@ -443,10 +160,11 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
 
-    rgbs = np.stack(rgbs, 0)
-    disps = np.stack(disps, 0)
+        _ = [extrass[k].append(extras[k]) for k in extras]
 
-    return rgbs, disps
+    rgbs = np.stack(rgbs, 0)
+    extrass = {k: np.stack(extrass[k], 0) for k in extrass}
+    return rgbs, extrass
 
 
 def create_nerf(args):
@@ -473,11 +191,12 @@ def create_nerf(args):
     model_fine = None
     if args.N_importance > 0:
         if args.keypoint_embedding_size is not None and args.keypoint_embedding_size > 0:
-            model_fine = init_nerf_model_with_categories(
+            model_fine = NERFCO.nerf_keypoint_network.init_nerf_model_with_categories(
                 D=args.netdepth_fine, W=args.netwidth_fine,
                 input_ch=input_ch, output_ch=output_ch, skips=skips,
                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
-                keypoint_embedding_size=args.keypoint_embedding_size
+                keypoint_embedding_size=args.keypoint_embedding_size,
+                category_activation=args.category_activation
             )
         else:
             model_fine = init_nerf_model(
@@ -489,7 +208,7 @@ def create_nerf(args):
         grad_vars += model_fine.trainable_variables
         models['model_fine'] = model_fine
 
-    def network_query_fn(inputs, viewdirs, network_fn): return run_network(
+    def network_query_fn(inputs, viewdirs, network_fn): return NERFCO.nerf_renderer.run_network(
         inputs, viewdirs, network_fn,
         embed_fn=embed_fn,
         embeddirs_fn=embeddirs_fn,
@@ -531,7 +250,7 @@ def create_nerf(args):
     # print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
         ft_weights = ckpts[-1]
-        # print('Reloading from', ft_weights)
+        print('Reloading from', ft_weights)
         model.set_weights(np.load(ft_weights, allow_pickle=True))
         start = int(ft_weights[-10:-4]) + 1
         # print('Resetting step to', start)
@@ -545,6 +264,15 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, models
 
 
+def shuffler(array, permutations=None):
+    len_first = len(array)
+    if permutations is None:
+        permutations = np.random.permutation(len_first)
+        return array[permutations], permutations
+    else:
+        return array[permutations]
+
+
 def unison_shuffled_copies(list_of_arrays: list):
     len_first = len(list_of_arrays[0])
     for _array in list_of_arrays:
@@ -554,28 +282,41 @@ def unison_shuffled_copies(list_of_arrays: list):
     return [_array[p] for _array in list_of_arrays]
 
 
-def shuffle_training_data(rays_rgb, pixel_train_masks=None, keypoint_masks=None):
-    print('shuffle rays')
-    data_to_shuffle = []
-    data_to_shuffle.append(rays_rgb)
-    if pixel_train_masks is not None:
-        data_to_shuffle.append(pixel_train_masks)
+def render_test_data(args, render_poses, images, i_test, start, render_kwargs_test, hwf, K=None, embeddings=None, gt_keypoint_map=None):
+    print('RENDER ONLY')
+    if args.render_test:
+        # render_test switches to test poses
+        images = images[i_test]
+    else:
+        # Default is smoother render_poses path
+        images = None
 
-    if keypoint_masks is not None:
-        data_to_shuffle.append(keypoint_masks)
+    testsavedir = os.path.join(args.basedir, args.expname, 'renderonly_{}_{:06d}'.format(
+        'test' if args.render_test else 'path', start))
+    os.makedirs(testsavedir, exist_ok=True)
+    print('test poses shape', render_poses.shape)
+    if args.use_K:
+        print('get rays K')
+        render_kwargs_test['K'] = K
 
-    data_to_shuffle = unison_shuffled_copies(data_to_shuffle)
-    print('done')
-    return data_to_shuffle
+    rgbs, extras = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
+                          gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+    print('Done rendering', testsavedir)
+    imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
+                     to8b(rgbs), fps=30, quality=8)
 
-
-def integer_to_one_hot(keypoint_masks_batch, number_of_categories):
-    # encoding = tf.zeros(shape=(len(keypoint_masks_batch), number_of_categories + 1), dtype=tf.float32)
-    # coords = zip(list(range(len(keypoint_masks_batch))), keypoint_masks_batch)
-    # encoding[coords] = 1.
-    # return encoding
-    return tf.one_hot(keypoint_masks_batch, number_of_categories + 1, dtype=tf.float32)
-
+    if 'keypoint_map' in extras:
+        for i, (inferred_rgb_map, inferred_keypoint_map) in enumerate(zip(rgbs, extras['keypoint_map'])):
+            if len(embeddings.embeddings.shape) > 1:
+                kp_map, kp_acc_map = NERFCO.nerf_keypoint_network.create_embedded_keypoint_image(inferred_keypoint_map,
+                                                                                                 embeddings,
+                                                                                                 gt_keypoint_map[i])
+            else:
+                kp_map, kp_acc_map = NERFCO.nerf_keypoint_network.create_binary_keypoint_image(np.squeeze(inferred_keypoint_map),
+                                                                                               inferred_rgb_map,
+                                                                                               gt_keypoint_map[i])
+            imageio.imsave(os.path.join(testsavedir, f'kp_map_{i}.jpg'), to8b(kp_map))
+            imageio.imsave(os.path.join(testsavedir, f'kp_acc_map_{i}.jpg'), to8b(kp_acc_map))
 
 
 def train():
@@ -636,6 +377,7 @@ def train():
         if args.get_depth_maps:
             depth_maps = extras['depth_maps']
 
+        K = None
         if args.use_K:
             K = extras['K']
 
@@ -699,23 +441,6 @@ def train():
     H, W = int(H), int(W)
     hwf = [H, W, focal]
 
-    if args.colmap_keypoints_filename is not None:
-        from NERFCO.nerf_keypoint_network import get_keypoint_masks
-        from NERFCO.embeddings.keras_example import get_simple_embedding
-        filename_splits = extras['filenames']
-        train_keypoint_masks, args.number_of_keypoints = \
-            get_keypoint_masks(args.colmap_keypoints_filename,
-                               i_train,
-                               filename_splits,
-                               H, W)
-
-        keypoint_embeddings = get_simple_embedding(args.number_of_keypoints + 1, args.keypoint_embedding_size)
-    # TODO: integrate the new masks into the input and output training data
-    # TODO: make the loss for keypoint_embeddings
-
-    if args.render_test:
-        render_poses = np.array(poses[i_test])
-
     # Create log dir and copy the config file
     basedir = args.basedir
     expname = args.expname
@@ -730,6 +455,45 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    enable_keypoints = False
+    if args.colmap_keypoints_filename is not None:
+        enable_keypoints = True
+        from NERFCO.nerf_keypoint_network import get_keypoint_masks
+        from MODELS.RandomEmbeddings import RandomEmbeddings
+        filename_splits = extras['filenames']
+        train_keypoint_masks, args.number_of_keypoints = \
+            get_keypoint_masks(args.colmap_keypoints_filename,
+                               i_train,
+                               filename_splits,
+                               H, W)
+
+        train_keypoint_masks = train_keypoint_masks.ravel()
+        test_keypoint_masks, test_keypoint_count = \
+            get_keypoint_masks(args.colmap_keypoints_filename,
+                               i_test,
+                               filename_splits,
+                               H, W)
+
+        number_of_keypoints = np.sum(train_keypoint_masks > 0)
+        keypoint_loss_coeff = 0
+        assert test_keypoint_count == args.number_of_keypoints, \
+            f'test_keypoint_count: {test_keypoint_count} == args.number_of_keypoints: {args.number_of_keypoints}'
+
+        print(train_keypoint_masks.shape, train_keypoint_masks.min(), train_keypoint_masks.max(), number_of_keypoints)
+        keypoint_embeddings_filename = os.path.join(args.basedir, args.expname, 'keypoint_embeddings.pkl')
+        if os.path.isfile(keypoint_embeddings_filename):
+            print(f'loading embeddings from: {keypoint_embeddings_filename}')
+            keypoint_embeddings = RandomEmbeddings(args.number_of_keypoints + 1,
+                                                   args.keypoint_embedding_size,
+                                                   embedding_filename=keypoint_embeddings_filename)
+        else:
+            keypoint_embeddings = RandomEmbeddings(args.number_of_keypoints + 1,
+                                                   args.keypoint_embedding_size)
+            keypoint_embeddings.save_embeddings(keypoint_embeddings_filename)
+
+    if args.render_test:
+        render_poses = np.array(poses[i_test])
+
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
         args)
@@ -743,26 +507,18 @@ def train():
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
-        print('RENDER ONLY')
-        if args.render_test:
-            # render_test switches to test poses
-            images = images[i_test]
-        else:
-            # Default is smoother render_poses path
-            images = None
-
-        testsavedir = os.path.join(basedir, expname, 'renderonly_{}_{:06d}'.format(
-            'test' if args.render_test else 'path', start))
-        os.makedirs(testsavedir, exist_ok=True)
-        print('test poses shape', render_poses.shape)
-
-        rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
-                              gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
-        print('Done rendering', testsavedir)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
-                         to8b(rgbs), fps=30, quality=8)
-
-        return
+        # render_poses = poses[::args.testskip]
+        render_test_data(args,
+                         render_poses,
+                         images,
+                         i_test,
+                         start,
+                         render_kwargs_test,
+                         hwf,
+                         K if K is not None else None,
+                         embeddings=keypoint_embeddings if enable_keypoints else None,
+                         gt_keypoint_map=test_keypoint_masks if enable_keypoints else None)
+        exit(0)
 
     # Create optimizer
     lrate = args.lrate
@@ -795,7 +551,7 @@ def train():
         # for each pixel in the image. This stack() adds a new dimension.
         if args.use_K:
             print('get rays K')
-            rays = [get_rays_np_K(H, W, K, p) for p in poses[:, :3, :4]]
+            rays = [NERFCO.nerf_renderer.get_rays_np_K(H, W, K, p) for p in poses[:, :3, :4]]
         else:
             print('get rays')
             rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
@@ -817,11 +573,22 @@ def train():
         # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
         rays_rgb = rays_rgb.astype(np.float32)
+        if args.keypoint_oversample:
+            keypoint_mask = train_keypoint_masks.astype(np.bool)
+            over_sample = train_keypoint_masks.shape[0] // np.sum(keypoint_mask) - 1
+            keypoint_rays_rgb = rays_rgb[keypoint_mask]
+            non_zero_keypoints = train_keypoint_masks[keypoint_mask]
+            rays_rgb = np.concatenate([rays_rgb, np.repeat(keypoint_rays_rgb, over_sample, axis=0)])
+            train_keypoint_masks = np.concatenate([train_keypoint_masks, np.repeat(non_zero_keypoints, over_sample, axis=0)])
 
         # shuffle training data
-        shuffle_training_data(rays_rgb,
-                              pixel_train_masks=pixel_train_masks if args.mask_directory and args.sigma_masking else None,
-                              keypoint_masks=train_keypoint_masks if args.colmap_keypoints_filename is not None else None)
+        rays_rgb, permutations = shuffler(rays_rgb)
+        if args.mask_directory and args.sigma_masking:
+            pixel_train_masks = shuffler(pixel_train_masks, permutations)
+
+        if enable_keypoints:
+            train_keypoint_masks = shuffler(train_keypoint_masks, permutations)
+
         i_batch = 0
 
     N_iters = 1000000
@@ -836,7 +603,8 @@ def train():
     writer.set_as_default()
     for i in range(start, N_iters):
         time0 = time.time()
-
+        if i >= args.keypoint_iterations_start:
+            keypoint_loss_coeff = args.keypoint_loss_coeff
         # Sample random ray batch
 
         if use_batching:
@@ -846,7 +614,7 @@ def train():
             if args.sigma_masking:
                 in_mask_pixels_batch = pixel_train_masks[i_batch: i_batch + N_rand]
 
-            if args.colmap_keypoints_filename is not None:
+            if enable_keypoints:
                 keypoint_masks_batch = train_keypoint_masks[i_batch: i_batch + N_rand]
 
 
@@ -856,21 +624,24 @@ def train():
 
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
-                shuffle_training_data(rays_rgb,
-                                      pixel_train_masks=pixel_train_masks if args.mask_directory and args.sigma_masking else None,
-                                      keypoint_masks=train_keypoint_masks if args.colmap_keypoints_filename is not None else None)
+                rays_rgb, permutations = shuffler(rays_rgb)
+                if args.mask_directory and args.sigma_masking:
+                    pixel_train_masks = shuffler(pixel_train_masks, permutations)
+
+                if enable_keypoints:
+                    train_keypoint_masks = shuffler(train_keypoint_masks, permutations)
 
                 i_batch = 0
 
         else:
             # Random from one image
-            img_i = np.random.choice(i_train)
-            target = images[img_i]
-            pose = poses[img_i, :3, :4]
+            test_frame_number = np.random.choice(i_train)
+            target = images[test_frame_number]
+            pose = poses[test_frame_number, :3, :4]
 
             if N_rand is not None:
                 if args.use_K:
-                    rays_o, rays_d = get_rays_K(H, W, K, pose)
+                    rays_o, rays_d = NERFCO.nerf_renderer.get_rays_K(H, W, K, pose)
                 else:
                     rays_o, rays_d = get_rays(H, W, focal, pose)
                 if i < args.precrop_iters:
@@ -907,14 +678,15 @@ def train():
                 loss = photometric_loss_function(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
             else:
                 loss = photometric_loss_function(rgb, target_s)
-                print(i_batch, loss)
 
             if args.force_black_background:
                 loss += 0.1 * photometric_loss_function(rgb[~in_mask_pixels_batch], 0.)
 
-            if 'categories' in extras:
-                network_output_categories = extras['categories']
-                loss += img2mse(network_output_categories, keypoint_embeddings[keypoint_masks_batch])
+            if 'keypoint_map' in extras:
+                keypoint_loss = NERFCO.nerf_keypoint_network.get_keypoint_loss(keypoint_embeddings,
+                                                                               keypoint_masks_batch,
+                                                                               extras['keypoint_map'])
+                loss += keypoint_loss_coeff * keypoint_loss
 
 
             trans = extras['raw'][..., -1]
@@ -937,6 +709,11 @@ def train():
                 if args.force_black_background:
                     loss += 0.1 * photometric_loss_function(extras['rgb0'][~in_mask_pixels_batch], 0.)
 
+                if 'keypoint_map_0' in extras:
+                    coarse_keypoint_loss = NERFCO.nerf_keypoint_network.get_keypoint_loss(keypoint_embeddings,
+                                                                                          keypoint_masks_batch,
+                                                                                          extras['keypoint_map_0'])
+                    loss += keypoint_loss_coeff * coarse_keypoint_loss
 
         gradients = tape.gradient(loss, grad_vars)
         optimizer.apply_gradients(zip(gradients, grad_vars))
@@ -959,8 +736,9 @@ def train():
 
         if i % args.i_video == 0 and i > 0:
 
-            rgbs, disps = render_path(
+            rgbs, test_extras = render_path(
                 render_poses, hwf, args.chunk, render_kwargs_test)
+            disps = test_extras['disp']
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
                 basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
@@ -987,9 +765,19 @@ def train():
             print('Saved test set')
 
         if i % args.i_print == 0 or i < 10:
+            output_line = f'{expname} {i}, {psnr.numpy():.2g}, {loss.numpy():.2g} '
+            # report loss
+            if enable_keypoints:
+                gt_kp_mask = keypoint_masks_batch.astype(np.bool)
+                network_output = np.squeeze(extras['keypoint_map'])
+                output_line += f'kp loss:{keypoint_loss:.2g} '
+                if len(network_output.shape) == 1:
+                    output_line+= f'GT kp#:{int(np.sum(keypoint_masks_batch.astype(np.bool).astype(np.float))):d} '\
+                                  f'TP+TN:{np.sum(np.isclose(gt_kp_mask.astype(np.float), network_output)) / network_output.shape[0]:.2g} '\
+                                  f'TP:{np.sum(np.isclose(gt_kp_mask[gt_kp_mask].astype(np.float), network_output[gt_kp_mask])) / np.sum(gt_kp_mask):.2g} '\
+                                  f'TN:{np.sum(np.isclose(gt_kp_mask[~gt_kp_mask].astype(np.float), network_output[~gt_kp_mask])) / np.sum(~gt_kp_mask):.2g} '
 
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            # print('iter time {:.05f}'.format(dt))
+            print(output_line)
             with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
                 tf.contrib.summary.scalar('loss', loss)
                 tf.contrib.summary.scalar('psnr', psnr)
@@ -997,12 +785,17 @@ def train():
                 if args.N_importance > 0:
                     tf.contrib.summary.scalar('psnr0', psnr0)
 
+                if enable_keypoints:
+                    tf.contrib.summary.histogram('keypoint output', network_output)
+                    tf.contrib.summary.scalar('keypoint_loss', keypoint_loss)
+
             if i % args.i_img == 0:
+                # report accuracy
 
                 # Log a rendered validation view to Tensorboard
-                img_i = np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3, :4]
+                test_frame_number = np.random.choice(i_val)
+                target = images[test_frame_number]
+                pose = poses[test_frame_number, :3, :4]
 
                 rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
                                                 **render_kwargs_test)
@@ -1015,8 +808,8 @@ def train():
                 imageio.imwrite(os.path.join(testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
 
                 with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
+                    output_image = to8b(rgb)[tf.newaxis]
+                    tf.contrib.summary.image('rgb', output_image)
                     tf.contrib.summary.image(
                         'disp', disp[tf.newaxis, ..., tf.newaxis])
                     tf.contrib.summary.image(
@@ -1024,9 +817,48 @@ def train():
 
                     tf.contrib.summary.scalar('psnr_holdout', psnr)
                     tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+                    if enable_keypoints:
+                        # TODO: test why the train renders seem to be less lossy than the test renders
+                        # the test renders highlight the entire object whereas
+                        # the train renders don't, but have a good loss
+                        test_frame_in_split = np.where(i_val == test_frame_number)[0][0]
+                        test_keypoint_mask = test_keypoint_masks[test_frame_in_split]
+                        test_non_zeros_kp_mask = test_keypoint_mask.astype(np.bool)
+                        test_keypoint_loss = NERFCO.nerf_keypoint_network.get_keypoint_loss(keypoint_embeddings,
+                                                                                       test_keypoint_mask,
+                                                                                       extras['keypoint_map'])
+                        tf.contrib.summary.scalar('test_keypoint_loss', test_keypoint_loss)
+
+                        if len(keypoint_embeddings.embeddings.shape) == 1:
+                            network_output = extras['keypoint_map']
+                            network_output_image = np.reshape(network_output.numpy(), (H, W))
+                            keypoint_accuracy_image = network_output_image == test_non_zeros_kp_mask
+                            tf.contrib.summary.histogram('keypointyness', network_output)
+                            tf.contrib.summary.scalar('keypoint_acc',
+                                                      np.sum(keypoint_accuracy_image) / (H*W))
+                            tf.contrib.summary.scalar('non_zero_keypoint_acc',
+                                                      np.sum(keypoint_accuracy_image[test_non_zeros_kp_mask]) / np.sum(
+                                                          test_non_zeros_kp_mask))
+
+                            tf.contrib.summary.image('keypoint_image_acc',
+                                                     to8b(keypoint_accuracy_image)[tf.newaxis, ..., tf.newaxis])
+
+                        else:
+                            inferred_keypoint_image, keypoint_accuracy_image = \
+                                NERFCO.nerf_keypoint_network.create_embedded_keypoint_image(extras['keypoint_map'],
+                                                                                            keypoint_embeddings,
+                                                                                            test_keypoint_mask)
+
+                            tf.contrib.summary.scalar('keypoint_acc', np.sum(keypoint_accuracy_image) / (H * W))
+                            tf.contrib.summary.scalar('non_zero_keypoint_acc',
+                                                      np.sum(keypoint_accuracy_image[test_non_zeros_kp_mask]) / np.sum(test_non_zeros_kp_mask))
+
+                            tf.contrib.summary.image('keypoint_image_acc',
+                                                     to8b(keypoint_accuracy_image)[tf.newaxis, ..., tf.newaxis])
+                            tf.contrib.summary.image('keypoint_image',
+                                                     to8b(inferred_keypoint_image)[tf.newaxis, ..., tf.newaxis])
 
                 if args.N_importance > 0:
-
                     with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
                         tf.contrib.summary.image(
                             'rgb0', to8b(extras['rgb0'])[tf.newaxis])
