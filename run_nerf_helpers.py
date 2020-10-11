@@ -211,3 +211,13 @@ def sample_pdf(bins, weights, N_samples, det=False):
     samples = bins_g[..., 0] + t * (bins_g[..., 1]-bins_g[..., 0])
 
     return samples
+
+
+def batchify(fn, chunk):
+    """Constructs a version of 'fn' that applies to smaller batches."""
+    if chunk is None:
+        return fn
+
+    def ret(inputs):
+        return tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
+    return ret

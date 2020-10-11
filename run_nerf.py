@@ -1,27 +1,14 @@
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 from collections import defaultdict
 import time
-import copy
 
 from args_and_config import config_parser
 from run_nerf_helpers import *
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
-import MODELS.tf_rotations
 import NERFCO.nerf_keypoint_network
-import MODELS.tf_nearest_neighbours
 import NERFCO.nerf_renderer
-
-
-def batchify(fn, chunk):
-    """Constructs a version of 'fn' that applies to smaller batches."""
-    if chunk is None:
-        return fn
-
-    def ret(inputs):
-        return tf.concat([fn(inputs[i:i+chunk]) for i in range(0, inputs.shape[0], chunk)], 0)
-    return ret
 
 
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
@@ -225,6 +212,7 @@ def create_nerf(args):
         'use_viewdirs': args.use_viewdirs,
         'white_bkgd': args.white_bkgd,
         'raw_noise_std': args.raw_noise_std,
+        'choose_keypoint_closest_depth': args.choose_keypoint_closest_depth,
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -258,7 +246,7 @@ def create_nerf(args):
         if model_fine is not None:
             ft_weights_fine = '{}_fine_{}'.format(
                 ft_weights[:-11], ft_weights[-10:])
-            # print('Reloading fine from', ft_weights_fine)
+            print('Reloading fine from', ft_weights_fine)
             model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, models
@@ -488,7 +476,8 @@ def train():
                                                    embedding_filename=keypoint_embeddings_filename)
         else:
             keypoint_embeddings = RandomEmbeddings(args.number_of_keypoints + 1,
-                                                   args.keypoint_embedding_size)
+                                                   args.keypoint_embedding_size,
+                                                   zero_embedding_origin=args.zero_embedding_origin)
             keypoint_embeddings.save_embeddings(keypoint_embeddings_filename)
 
     if args.render_test:
@@ -581,16 +570,6 @@ def train():
             rays_rgb = np.concatenate([rays_rgb, np.repeat(keypoint_rays_rgb, over_sample, axis=0)])
             train_keypoint_masks = np.concatenate([train_keypoint_masks, np.repeat(non_zero_keypoints, over_sample, axis=0)])
 
-        # shuffle training data
-        rays_rgb, permutations = shuffler(rays_rgb)
-        if args.mask_directory and args.sigma_masking:
-            pixel_train_masks = shuffler(pixel_train_masks, permutations)
-
-        if enable_keypoints:
-            train_keypoint_masks = shuffler(train_keypoint_masks, permutations)
-
-        i_batch = 0
-
     N_iters = 1000000
     print('Begin')
     print('TRAIN views are', i_train)
@@ -608,6 +587,17 @@ def train():
         # Sample random ray batch
 
         if use_batching:
+            # shuffle
+            if i == 0 or i_batch >= rays_rgb.shape[0]:
+                rays_rgb, permutations = shuffler(rays_rgb)
+                if args.mask_directory and args.sigma_masking:
+                    pixel_train_masks = shuffler(pixel_train_masks, permutations)
+
+                if enable_keypoints:
+                    train_keypoint_masks = shuffler(train_keypoint_masks, permutations)
+
+                i_batch = 0
+
             # Random over all images
             batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
             batch = tf.transpose(batch, [1, 0, 2])
@@ -617,21 +607,12 @@ def train():
             if enable_keypoints:
                 keypoint_masks_batch = train_keypoint_masks[i_batch: i_batch + N_rand]
 
+            i_batch += N_rand
 
             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
             # target_s[n, rgb] = example_id, observed color.
             batch_rays, target_s = batch[:2], batch[2]
 
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                rays_rgb, permutations = shuffler(rays_rgb)
-                if args.mask_directory and args.sigma_masking:
-                    pixel_train_masks = shuffler(pixel_train_masks, permutations)
-
-                if enable_keypoints:
-                    train_keypoint_masks = shuffler(train_keypoint_masks, permutations)
-
-                i_batch = 0
 
         else:
             # Random from one image
@@ -822,23 +803,23 @@ def train():
                         # the test renders highlight the entire object whereas
                         # the train renders don't, but have a good loss
                         test_frame_in_split = np.where(i_val == test_frame_number)[0][0]
-                        test_keypoint_mask = test_keypoint_masks[test_frame_in_split]
-                        test_non_zeros_kp_mask = test_keypoint_mask.astype(np.bool)
+                        gt_keypoint_mask = test_keypoint_masks[test_frame_in_split]
+                        gt_non_zeros_kp_mask = gt_keypoint_mask.astype(np.bool)
                         test_keypoint_loss = NERFCO.nerf_keypoint_network.get_keypoint_loss(keypoint_embeddings,
-                                                                                       test_keypoint_mask,
-                                                                                       extras['keypoint_map'])
+                                                                                            gt_keypoint_mask,
+                                                                                            extras['keypoint_map'])
                         tf.contrib.summary.scalar('test_keypoint_loss', test_keypoint_loss)
 
                         if len(keypoint_embeddings.embeddings.shape) == 1:
                             network_output = extras['keypoint_map']
                             network_output_image = np.reshape(network_output.numpy(), (H, W))
-                            keypoint_accuracy_image = network_output_image == test_non_zeros_kp_mask
+                            keypoint_accuracy_image = network_output_image == gt_non_zeros_kp_mask
                             tf.contrib.summary.histogram('keypointyness', network_output)
                             tf.contrib.summary.scalar('keypoint_acc',
                                                       np.sum(keypoint_accuracy_image) / (H*W))
                             tf.contrib.summary.scalar('non_zero_keypoint_acc',
-                                                      np.sum(keypoint_accuracy_image[test_non_zeros_kp_mask]) / np.sum(
-                                                          test_non_zeros_kp_mask))
+                                                      np.sum(keypoint_accuracy_image[gt_non_zeros_kp_mask]) / np.sum(
+                                                          gt_non_zeros_kp_mask))
 
                             tf.contrib.summary.image('keypoint_image_acc',
                                                      to8b(keypoint_accuracy_image)[tf.newaxis, ..., tf.newaxis])
@@ -847,11 +828,11 @@ def train():
                             inferred_keypoint_image, keypoint_accuracy_image = \
                                 NERFCO.nerf_keypoint_network.create_embedded_keypoint_image(extras['keypoint_map'],
                                                                                             keypoint_embeddings,
-                                                                                            test_keypoint_mask)
+                                                                                            gt_keypoint_mask)
 
                             tf.contrib.summary.scalar('keypoint_acc', np.sum(keypoint_accuracy_image) / (H * W))
                             tf.contrib.summary.scalar('non_zero_keypoint_acc',
-                                                      np.sum(keypoint_accuracy_image[test_non_zeros_kp_mask]) / np.sum(test_non_zeros_kp_mask))
+                                                      np.sum(keypoint_accuracy_image[gt_non_zeros_kp_mask]) / np.sum(gt_non_zeros_kp_mask))
 
                             tf.contrib.summary.image('keypoint_image_acc',
                                                      to8b(keypoint_accuracy_image)[tf.newaxis, ..., tf.newaxis])

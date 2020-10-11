@@ -173,4 +173,8 @@ def config_parser():
     parser.add_argument("--keypoint_iterations_start", type=int, default=0, help='keypoint_iterations_start')
 
     parser.add_argument("--keypoint_loss_coeff", type=float, default=1.0, help='keypoint_loss_coeff')
+
+    parser.add_argument("--choose_keypoint_closest_depth", action='store_true', help='choose_keypoint_closest_depth')
+
+    parser.add_argument("--zero_embedding_origin", action='store_true', help='zero_embedding_origin')
     return parser
