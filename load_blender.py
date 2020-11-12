@@ -3,6 +3,7 @@ import tensorflow as tf
 import numpy as np
 import imageio 
 import json
+import tqdm
 
 from load_llff import load_masks
 from NERFCO.create_linemod_data import linemod_camera_intrinsics
@@ -50,7 +51,25 @@ def linemod_dpt(path):
     return (np.fromfile(dpt, dtype=np.uint16).reshape((rows, cols)) / 1000.).astype(np.float32)
 
 
-def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None, image_field='file_path', image_dir_override=None):
+def smooth_kinect_depth(depth_raw):
+    import scipy.interpolate
+    depth = depth_raw / 1000.
+    x = np.arange(depth_raw.shape[1])
+    y = np.arange(depth_raw.shape[0])
+    # mask invalid values
+    array = np.ma.masked_where((depth_raw == 2 ** 16 - 1) | (depth_raw == 0), depth)
+    # array.mask = invalid_depth_mask
+    xx, yy = np.meshgrid(x, y)
+    # get only the valid values
+    x1 = xx[~array.mask]
+    y1 = yy[~array.mask]
+    newarr = array[~array.mask]
+    depth = scipy.interpolate.griddata((x1, y1), newarr.ravel(), (xx, yy), method='nearest')
+    return depth.astype(np.float32)
+
+
+def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None,
+                      image_field='file_path', image_dir_override=None, trainskip=1, test_finish=None):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -63,17 +82,19 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
     all_depth_maps = []
     counts = [0]
     all_filenames = []
+    all_depth_filenames = []
     for s in splits:
         meta = metas[s]
         imgs = []
         poses = []
         depth_maps = []
         if s == 'train' or testskip == 0:
-            skip = 1
+            frame_slice = slice(None, None, trainskip)
         else:
-            skip = testskip
+            frame_slice = slice(None, test_finish, testskip)
         filenames = []
-        for frame in meta['frames'][::skip]:
+        depth_filenames = []
+        for frame in tqdm.tqdm(meta['frames'][frame_slice]):
             if any(ext in frame[image_field] for ext in ['png', 'jpg']):
                 image_filename = os.path.join(basedir, frame[image_field])
             else:
@@ -90,15 +111,26 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
 
             pose = np.array(frame['transform_matrix'])
             poses.append(pose)
-            if get_depths and 'depth_path' in frame:
+
+            # depth
+            if 'depth_path' in frame:
                 #eg. r_0_depth_0001.png
                 depth_filename = frame['depth_path']
-                assert os.path.isfile(depth_filename), f'filename:{depth_filename} not found'
-                if '.png' in depth_filename:
-                    depth = imageio.imread(depth_filename)
-                elif '.dpt' in depth_filename:
-                    depth = linemod_dpt(depth_filename)
-                depth_maps.append(depth)
+                depth_filenames.append(depth_filename)
+                if get_depths:
+                    assert os.path.isfile(depth_filename), f'filename:{depth_filename} not found'
+                    if '.png' in depth_filename:
+                        # kinect depth
+                        depth_raw = imageio.imread(depth_filename)
+                        if s == 'train':
+                            depth = smooth_kinect_depth(depth_raw)
+                        else:
+                            depth = depth_raw / 1000.
+
+                    elif '.dpt' in depth_filename:
+                        depth = linemod_dpt(depth_filename)
+
+                    depth_maps.append(depth)
 
         imgs = (np.array(imgs) / 255.).astype(np.float32) # keep all 4 channels (RGBA)
         poses = np.array(poses).astype(np.float32)
@@ -107,6 +139,8 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         all_poses.append(poses)
         all_depth_maps.append(depth_maps)
         all_filenames.append(filenames)
+        all_depth_filenames.append(depth_filenames)
+
     i_split = [np.arange(counts[i], counts[i+1]) for i in range(3)]
 
     extras = {}
@@ -134,10 +168,10 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         extras['depth_maps'] = np.stack(all_depth_maps, axis=0)
 
     if 'K' in meta:
-        extras['K'] = np.array(linemod_camera_intrinsics)
+        extras['K'] = np.array(meta['K'])
 
     extras['filenames'] = all_filenames
-
+    extras['depth_filenames'] = all_depth_filenames
     return imgs, poses, render_poses, [H, W, focal], i_split, extras
 
 

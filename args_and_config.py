@@ -177,4 +177,27 @@ def config_parser():
     parser.add_argument("--choose_keypoint_closest_depth", action='store_true', help='choose_keypoint_closest_depth')
 
     parser.add_argument("--zero_embedding_origin", action='store_true', help='zero_embedding_origin')
+
+    parser.add_argument("--keypoints_filename", type=str, default=None, help='keypoints_filename')
+
+    parser.add_argument("--keypoint_detector", type=str, default=None, help='keypoint_detector')
+
+    parser.add_argument("--keypoint_dropout", action='store_true', help='keypoint_dropout')
+
+    parser.add_argument("--keypoint_regularize", action='store_true', help='keypoint_regularize')
+
+    parser.add_argument("--autoencoded_keypoints_filename", type=str, default=None, help='autoencoded_keypoints_filename')
+
+    parser.add_argument("--learnable_embeddings_filename", type=str, default=None, help='learnable_embeddings_filename')
+
+    parser.add_argument("--trainskip", type=int, default=1, help='trainskip')
+
+    parser.add_argument("--depth_from_camera", action='store_true', help='use depth_from_camera in rendering')
+
+    parser.add_argument("--test_finish", type=int, default=None, help='test_finish frame')
+
+    parser.add_argument("--near", type=float, default=None, help='near')
+
+    parser.add_argument("--far", type=float, default=None, help='far')
+
     return parser

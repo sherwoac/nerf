@@ -62,7 +62,12 @@ def render(H, W, focal,
             rays_o, rays_d = get_rays(H, W, focal, c2w)
     else:
         # use provided ray batch
-        rays_o, rays_d = rays
+        if len(rays) == 3:
+            rays_o, rays_d, depth = rays
+            far = depth[:, tf.newaxis] * 1.1
+            near = depth[:, tf.newaxis] * 0.9
+        else:
+            rays_o, rays_d = rays
 
     # hack for K not an argument of render_rays
     # TODO: can only be solved with total refactor
@@ -91,8 +96,9 @@ def render(H, W, focal,
     # Create ray batch
     rays_o = tf.cast(tf.reshape(rays_o, [-1, 3]), dtype=tf.float32)
     rays_d = tf.cast(tf.reshape(rays_d, [-1, 3]), dtype=tf.float32)
-    near, far = near * \
-        tf.ones_like(rays_d[..., :1]), far * tf.ones_like(rays_d[..., :1])
+    if not (type(near) == np.ndarray and type(far) == np.ndarray):
+        near, far = near * \
+            tf.ones_like(rays_d[..., :1]), far * tf.ones_like(rays_d[..., :1])
 
     # (ray origin, ray direction, min dist, max dist) for each ray
     rays = tf.concat([rays_o, rays_d, near, far], axis=-1)
@@ -171,7 +177,6 @@ def create_nerf(args):
         input_ch=input_ch, output_ch=output_ch, skips=skips,
         input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
 
-
     grad_vars = model.trainable_variables
     models = {'model': model}
 
@@ -183,7 +188,9 @@ def create_nerf(args):
                 input_ch=input_ch, output_ch=output_ch, skips=skips,
                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
                 keypoint_embedding_size=args.keypoint_embedding_size,
-                category_activation=args.category_activation
+                category_activation=args.category_activation,
+                keypoint_regularize=args.keypoint_regularize,
+                keypoint_dropout=args.keypoint_dropout,
             )
         else:
             model_fine = init_nerf_model(
@@ -191,6 +198,9 @@ def create_nerf(args):
                 input_ch=input_ch, output_ch=output_ch, skips=skips,
                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs
             )
+
+        if args.learnable_embeddings_filename is not None:
+            models['keypoint_embeddings'] = NERFCO.nerf_keypoint_network.get_learnable_embeddings(args)
 
         grad_vars += model_fine.trainable_variables
         models['model_fine'] = model_fine
@@ -290,12 +300,15 @@ def render_test_data(args, render_poses, images, i_test, start, render_kwargs_te
     rgbs, extras = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
                           gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
     print('Done rendering', testsavedir)
+    for i, depth_map in enumerate(extras['depth_map']):
+        imageio.imsave(os.path.join(testsavedir, f'depth_map_{i}.jpg'), depth_map)
+
     imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
                      to8b(rgbs), fps=30, quality=8)
 
     if 'keypoint_map' in extras:
         for i, (inferred_rgb_map, inferred_keypoint_map) in enumerate(zip(rgbs, extras['keypoint_map'])):
-            if len(embeddings.embeddings.shape) > 1:
+            if len(embeddings.shape) > 1:
                 kp_map, kp_acc_map = NERFCO.nerf_keypoint_network.create_embedded_keypoint_image(inferred_keypoint_map,
                                                                                                  embeddings,
                                                                                                  gt_keypoint_map[i])
@@ -357,7 +370,8 @@ def train():
             mask_directory=args.mask_directory,
             get_depths=args.get_depth_maps,
             image_field=args.image_fieldname,
-            image_dir_override=args.image_dir_override)
+            image_dir_override=args.image_dir_override,
+        trainskip=args.trainskip)
 
         if args.mask_directory is not None:
             masks = extras['masks']
@@ -403,6 +417,7 @@ def train():
 
     elif args.dataset_type == 'deepvoxels':
 
+
         images, poses, render_poses, hwf, i_split = load_dv_data(scene=args.shape,
                                                                  basedir=args.datadir,
                                                                  testskip=args.testskip)
@@ -443,12 +458,14 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    filename_splits = extras['filenames']
     enable_keypoints = False
+    keypoint_loss_coeff = 0
     if args.colmap_keypoints_filename is not None:
         enable_keypoints = True
         from NERFCO.nerf_keypoint_network import get_keypoint_masks
-        from MODELS.RandomEmbeddings import RandomEmbeddings
-        filename_splits = extras['filenames']
+        import MODELS.random_embeddings
+
         train_keypoint_masks, args.number_of_keypoints = \
             get_keypoint_masks(args.colmap_keypoints_filename,
                                i_train,
@@ -463,29 +480,95 @@ def train():
                                H, W)
 
         number_of_keypoints = np.sum(train_keypoint_masks > 0)
-        keypoint_loss_coeff = 0
+
         assert test_keypoint_count == args.number_of_keypoints, \
             f'test_keypoint_count: {test_keypoint_count} == args.number_of_keypoints: {args.number_of_keypoints}'
 
         print(train_keypoint_masks.shape, train_keypoint_masks.min(), train_keypoint_masks.max(), number_of_keypoints)
         keypoint_embeddings_filename = os.path.join(args.basedir, args.expname, 'keypoint_embeddings.pkl')
-        if os.path.isfile(keypoint_embeddings_filename):
-            print(f'loading embeddings from: {keypoint_embeddings_filename}')
-            keypoint_embeddings = RandomEmbeddings(args.number_of_keypoints + 1,
-                                                   args.keypoint_embedding_size,
-                                                   embedding_filename=keypoint_embeddings_filename)
-        else:
-            keypoint_embeddings = RandomEmbeddings(args.number_of_keypoints + 1,
-                                                   args.keypoint_embedding_size,
-                                                   zero_embedding_origin=args.zero_embedding_origin)
-            keypoint_embeddings.save_embeddings(keypoint_embeddings_filename)
+        random_keypoint_embeddings_object = MODELS.random_embeddings.StaticRandomEmbeddings(
+            args.number_of_keypoints + 1,
+            args.keypoint_embedding_size,
+            embedding_filename=keypoint_embeddings_filename,
+            zero_embedding_origin=args.zero_embedding_origin)
 
-    if args.render_test:
-        render_poses = np.array(poses[i_test])
+        keypoint_embeddings = random_keypoint_embeddings_object.embeddings
+
+    import NERFCO.extract_keypoints
+    if args.autoencoded_keypoints_filename is not None:
+        enable_keypoints = True
+        assert os.path.isfile(args.autoencoded_keypoints_filename), \
+            f'autoencoded_keypoints_filename not found at: {args.autoencoded_keypoints_filename}'
+
+        import pickle
+        input = open(args.autoencoded_keypoints_filename, 'rb')
+        data = pickle.load(input)
+        input.close()
+
+        train_keypoint_masks = data['train_keypoint_masks']
+        test_keypoint_masks = data['test_keypoint_masks']
+        keypoint_embeddings = data['encoded_embeddings']
+
+        NERFCO.extract_keypoints.test_keypoint_masks(train_keypoint_masks, keypoint_embeddings)
+        NERFCO.extract_keypoints.test_keypoint_masks(test_keypoint_masks, keypoint_embeddings)
+
+        args.keypoint_embedding_size = keypoint_embeddings.shape[-1]
+        train_keypoint_masks = train_keypoint_masks.ravel()
+        print(f'loaded {args.keypoint_detector} keypoints: {keypoint_embeddings.shape} from: {args.autoencoded_keypoints_filename}')
+
+    elif args.keypoints_filename is not None and args.keypoint_detector in ['SIFT', 'ORB']:
+        enable_keypoints = True
+
+        train_keypoint_masks, test_keypoint_masks, keypoint_embeddings = \
+            NERFCO.extract_keypoints.get_keypoints_and_maps(
+                args.keypoints_filename,
+                i_test,
+                i_train,
+                filename_splits,
+                H, W)
+
+        NERFCO.extract_keypoints.test_keypoint_masks(train_keypoint_masks, keypoint_embeddings)
+        NERFCO.extract_keypoints.test_keypoint_masks(test_keypoint_masks, keypoint_embeddings)
+
+        args.keypoint_embedding_size = keypoint_embeddings.shape[-1]
+        train_keypoint_masks = train_keypoint_masks.ravel()
+        print(f'loaded {args.keypoint_detector} keypoints: {keypoint_embeddings.shape} from: {args.keypoints_filename}')
+
+    elif args.learnable_embeddings_filename is not None:
+        enable_keypoints = True
+
+        train_keypoint_masks, test_keypoint_masks, static_keypoints = \
+            NERFCO.extract_keypoints.get_keypoints_and_maps(
+                args.keypoints_filename,
+                i_test,
+                i_train,
+                filename_splits,
+                H, W)
+
+        args.number_of_keypoints = static_keypoints.shape[0]
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, models = create_nerf(
         args)
+
+    if args.use_K:
+        K_dict = {
+            'K': K,
+        }
+
+        render_kwargs_train.update(K_dict)
+        render_kwargs_test.update(K_dict)
+
+    if args.learnable_embeddings_filename is not None:
+        keypoint_embeddings = models['keypoint_embeddings']
+
+        NERFCO.extract_keypoints.test_keypoint_masks(train_keypoint_masks, keypoint_embeddings[:])
+        NERFCO.extract_keypoints.test_keypoint_masks(test_keypoint_masks, keypoint_embeddings[:])
+
+        args.keypoint_embedding_size = keypoint_embeddings.shape[-1]
+        train_keypoint_masks = train_keypoint_masks.ravel()
+        print(f'loaded {args.keypoint_detector} keypoints: {keypoint_embeddings.shape} from: {args.learnable_embeddings_filename}')
+
 
     bds_dict = {
         'near': tf.cast(near, tf.float32),
@@ -493,6 +576,9 @@ def train():
     }
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
+
+    if args.render_test:
+        render_poses = np.array(poses[i_test])
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
@@ -552,7 +638,11 @@ def train():
         # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
+        #
+        if args.depth_from_camera:
+            train_depths = np.stack([depth_maps[i] for i in i_train], axis=0).ravel()  # train images only
 
+        rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
         if args.mask_directory and not args.white_bkgd:
             train_masks = np.stack([masks[i] for i in i_train], axis=0)
             pixel_train_masks = train_masks.ravel()
@@ -562,13 +652,26 @@ def train():
         # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = np.reshape(rays_rgb, [-1, 3, 3])
         rays_rgb = rays_rgb.astype(np.float32)
+
         if args.keypoint_oversample:
             keypoint_mask = train_keypoint_masks.astype(np.bool)
             over_sample = train_keypoint_masks.shape[0] // np.sum(keypoint_mask) - 1
             keypoint_rays_rgb = rays_rgb[keypoint_mask]
             non_zero_keypoints = train_keypoint_masks[keypoint_mask]
-            rays_rgb = np.concatenate([rays_rgb, np.repeat(keypoint_rays_rgb, over_sample, axis=0)])
-            train_keypoint_masks = np.concatenate([train_keypoint_masks, np.repeat(non_zero_keypoints, over_sample, axis=0)])
+            assert non_zero_keypoints[0] == train_keypoint_masks[np.argmax(keypoint_mask)], 'first true keypoint should match'
+
+            # repeat rgb
+            repeated_keypoint_rays_rgb = np.repeat(keypoint_rays_rgb, over_sample, axis=0)
+            assert np.all(keypoint_rays_rgb[0] == repeated_keypoint_rays_rgb[0]), 'repeats should be the same'
+            rays_rgb = np.concatenate([rays_rgb, repeated_keypoint_rays_rgb])
+
+            # repeat keypoints
+            repeated_keypoint_masks = np.repeat(non_zero_keypoints, over_sample, axis=0)
+            assert repeated_keypoint_masks[0] == train_keypoint_masks[np.argmax(keypoint_mask)]
+            train_keypoint_masks = np.concatenate([train_keypoint_masks, repeated_keypoint_masks])
+
+            # check rays and keypoint masks are the same size
+            assert rays_rgb.shape[0] == train_keypoint_masks.shape[0]
 
     N_iters = 1000000
     print('Begin')
@@ -580,6 +683,7 @@ def train():
     writer = tf.contrib.summary.create_file_writer(
         os.path.join(basedir, 'summaries', expname))
     writer.set_as_default()
+    i_batch = 0
     for i in range(start, N_iters):
         time0 = time.time()
         if i >= args.keypoint_iterations_start:
@@ -588,7 +692,7 @@ def train():
 
         if use_batching:
             # shuffle
-            if i == 0 or i_batch >= rays_rgb.shape[0]:
+            if i == start or i_batch >= rays_rgb.shape[0]:
                 rays_rgb, permutations = shuffler(rays_rgb)
                 if args.mask_directory and args.sigma_masking:
                     pixel_train_masks = shuffler(pixel_train_masks, permutations)
@@ -596,22 +700,34 @@ def train():
                 if enable_keypoints:
                     train_keypoint_masks = shuffler(train_keypoint_masks, permutations)
 
+                if args.depth_from_camera:
+                    train_depths = shuffler(train_depths, permutations)
+
                 i_batch = 0
 
             # Random over all images
             batch = rays_rgb[i_batch:i_batch+N_rand]  # [B, 2+1, 3*?]
             batch = tf.transpose(batch, [1, 0, 2])
+
+
             if args.sigma_masking:
                 in_mask_pixels_batch = pixel_train_masks[i_batch: i_batch + N_rand]
 
             if enable_keypoints:
                 keypoint_masks_batch = train_keypoint_masks[i_batch: i_batch + N_rand]
 
+            if args.depth_from_camera:
+                train_depths_batch = train_depths[i_batch: i_batch + N_rand]
+
             i_batch += N_rand
 
             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
             # target_s[n, rgb] = example_id, observed color.
-            batch_rays, target_s = batch[:2], batch[2]
+            if False: # args.depth_from_camera:
+                batch_rays, target_s = (batch[0], batch[0], train_depths_batch), batch[2]
+            else:
+                batch_rays, target_s = batch[:2], batch[2]
+
 
 
         else:
@@ -625,6 +741,7 @@ def train():
                     rays_o, rays_d = NERFCO.nerf_renderer.get_rays_K(H, W, K, pose)
                 else:
                     rays_o, rays_d = get_rays(H, W, focal, pose)
+
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
                     dW = int(W//2 * args.precrop_frac)
@@ -648,13 +765,14 @@ def train():
 
         #####  Core optimization loop  #####
 
-        with tf.GradientTape() as tape:
+        with tf.GradientTape() as nerf_gradient_tape, tf.GradientTape() as embedding_gradient_tape:
 
             # Make predictions for color, disparity, accumulated opacity.
             rgb, disp, acc, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
             # Compute MSE loss between predicted and true RGB.
+
             if args.sigma_masking:
                 loss = photometric_loss_function(rgb[in_mask_pixels_batch], target_s[in_mask_pixels_batch])
             else:
@@ -669,6 +787,9 @@ def train():
                                                                                extras['keypoint_map'])
                 loss += keypoint_loss_coeff * keypoint_loss
 
+                if args.learnable_embeddings_filename is not None:
+                    embedding_loss = keypoint_loss_coeff * keypoint_embeddings.distance_correlation_loss(extras['xyz_map'],
+                                                                                                         extras['keypoint_map'])
 
             trans = extras['raw'][..., -1]
             psnr = mse2psnr(loss)
@@ -696,8 +817,15 @@ def train():
                                                                                           extras['keypoint_map_0'])
                     loss += keypoint_loss_coeff * coarse_keypoint_loss
 
-        gradients = tape.gradient(loss, grad_vars)
+                if args.depth_from_camera:
+                    loss += tf.losses.huber_loss(train_depths_batch, extras['depth_map'])
+
+        gradients = nerf_gradient_tape.gradient(loss, grad_vars)
         optimizer.apply_gradients(zip(gradients, grad_vars))
+
+        if args.learnable_embeddings_filename is not None:
+            gradients = embedding_gradient_tape.gradient(embedding_loss, models['keypoint_embeddings'].trainable_variables)
+            optimizer.apply_gradients(zip(gradients, models['keypoint_embeddings'].trainable_variables))
 
         dt = time.time()-time0
 
@@ -746,7 +874,7 @@ def train():
             print('Saved test set')
 
         if i % args.i_print == 0 or i < 10:
-            output_line = f'{expname} {i}, {psnr.numpy():.2g}, {loss.numpy():.2g} '
+            output_line = f'{expname} {i}, {psnr.numpy():.3g}, {loss.numpy():.3g} '
             # report loss
             if enable_keypoints:
                 gt_kp_mask = keypoint_masks_batch.astype(np.bool)
@@ -810,7 +938,7 @@ def train():
                                                                                             extras['keypoint_map'])
                         tf.contrib.summary.scalar('test_keypoint_loss', test_keypoint_loss)
 
-                        if len(keypoint_embeddings.embeddings.shape) == 1:
+                        if len(keypoint_embeddings.shape) == 1:
                             network_output = extras['keypoint_map']
                             network_output_image = np.reshape(network_output.numpy(), (H, W))
                             keypoint_accuracy_image = network_output_image == gt_non_zeros_kp_mask
