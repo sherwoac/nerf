@@ -69,7 +69,7 @@ def smooth_kinect_depth(depth_raw):
 
 
 def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', get_depths=False, mask_directory=None,
-                      image_field='file_path', image_dir_override=None, trainskip=1, test_finish=None):
+                      image_field='file_path', image_dir_override=None, trainskip=1, test_finish=None, train_frames_field='frames'):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -90,11 +90,14 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         depth_maps = []
         if s == 'train' or testskip == 0:
             frame_slice = slice(None, None, trainskip)
+            frames_field = train_frames_field
+            assert frames_field in meta, f'frames_field: {frames_field} not in meta: {meta.keys()}'
         else:
             frame_slice = slice(None, test_finish, testskip)
+            frames_field = 'frames'
         filenames = []
         depth_filenames = []
-        for frame in tqdm.tqdm(meta['frames'][frame_slice]):
+        for frame in tqdm.tqdm(meta[frames_field][frame_slice]):
             if any(ext in frame[image_field] for ext in ['png', 'jpg']):
                 image_filename = os.path.join(basedir, frame[image_field])
             else:
@@ -168,7 +171,7 @@ def load_blender_data(basedir, half_res=False, testskip=1, image_extn='.png', ge
         extras['depth_maps'] = np.stack(all_depth_maps, axis=0)
 
     if 'K' in meta:
-        extras['K'] = np.array(meta['K'])
+        extras['K'] = np.array(meta['K'], dtype=np.float32)
 
     extras['filenames'] = all_filenames
     extras['depth_filenames'] = all_depth_filenames

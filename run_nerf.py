@@ -1,6 +1,7 @@
 # os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 from collections import defaultdict
 import time
+import tqdm
 
 from args_and_config import config_parser
 from run_nerf_helpers import *
@@ -56,7 +57,7 @@ def render(H, W, focal,
 
     if c2w is not None:
         if 'K' in kwargs:
-            rays_o, rays_d = NERFCO.nerf_renderer.get_rays_K(H, W, kwargs['K'], c2w)
+            rays_o, rays_d = NERFCO.nerf_renderer.get_rays_tf_K(H, W, kwargs['K'], c2w)
         else:
             # special case to render full image
             rays_o, rays_d = get_rays(H, W, focal, c2w)
@@ -132,7 +133,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     t = time.time()
     extrass = defaultdict(list)
-    for i, c2w in enumerate(render_poses):
+    for i, c2w in tqdm.tqdm(enumerate(render_poses)):
         # print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, extras = render(
@@ -354,12 +355,12 @@ def train():
 
         print('DEFINING BOUNDS')
         if args.no_ndc:
-            near = tf.reduce_min(bds) * .9
-            far = tf.reduce_max(bds) * 1.
+            args.near = tf.reduce_min(bds) * .9
+            args.far = tf.reduce_max(bds) * 1.
         else:
-            near = 0.
-            far = 1.
-        print('NEAR FAR', near, far)
+            args.near = 0.
+            args.far = 1.
+        print('NEAR FAR', args.near, args.far)
 
     elif args.dataset_type == 'blender':
         images, poses, render_poses, hwf, i_split, extras = load_blender_data(
@@ -368,10 +369,11 @@ def train():
             args.testskip,
             args.image_extn,
             mask_directory=args.mask_directory,
-            get_depths=args.get_depth_maps,
+            get_depths=args.get_depth_maps if args.near is None and args.far is None else False,
             image_field=args.image_fieldname,
             image_dir_override=args.image_dir_override,
-        trainskip=args.trainskip)
+            trainskip=args.trainskip,
+            train_frames_field=args.frames_field)
 
         if args.mask_directory is not None:
             masks = extras['masks']
@@ -386,26 +388,26 @@ def train():
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
+        if args.near is None and args.far is None:
+            if args.Z_limits_from_pose:
+                Zs = poses[:, 2, 3]
+                args.near = np.min(np.abs(Zs)) * 0.5
+                args.far = np.max(np.abs(Zs)) * 1.5
 
-        if args.Z_limits_from_pose:
-            Zs = poses[:, 2, 3]
-            near = np.min(np.abs(Zs)) * 0.5
-            far = np.max(np.abs(Zs)) * 1.5
+            elif args.get_depth_maps and args.mask_directory is not None:
+                args.near = np.min(np.mean(depth_maps[masks])) * 0.9
+                args.far = np.max(depth_maps[masks]) * 1.1
+                print('using masked depth')
 
-        elif args.get_depth_maps and args.mask_directory is not None:
-            near = np.min(np.mean(depth_maps[masks])) * 0.9
-            far = np.max(depth_maps[masks]) * 1.1
-            print('using masked depth')
+            elif args.get_depth_maps:
+                args.near = np.min(depth_maps) * 0.9
+                args.far = np.max(depth_maps) * 1.1
+                print('using masked depth')
+            else:
+                args.near = 0.
+                args.far = 2.
 
-        elif args.get_depth_maps:
-            near = np.min(depth_maps) * 0.9
-            far = np.max(depth_maps) * 1.1
-
-        else:
-            near = 0.
-            far = 2.
-
-        print(f'near: {near} far: {far}')
+        print(f'args.near: {args.near} far: {args.far}')
 
         if args.mask_directory is not None and images.shape[-1] == 3:
             images = np.concatenate([images, masks[..., np.newaxis]], axis=-1)
@@ -427,8 +429,8 @@ def train():
         i_train, i_val, i_test = i_split
 
         hemi_R = np.mean(np.linalg.norm(poses[:, :3, -1], axis=-1))
-        near = hemi_R-1.
-        far = hemi_R+1.
+        args.near = hemi_R-1.
+        args.far = hemi_R+1.
 
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
@@ -571,8 +573,8 @@ def train():
 
 
     bds_dict = {
-        'near': tf.cast(near, tf.float32),
-        'far': tf.cast(far, tf.float32),
+        'near': tf.cast(args.near, tf.float32),
+        'far': tf.cast(args.far, tf.float32),
     }
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
@@ -626,7 +628,7 @@ def train():
         # for each pixel in the image. This stack() adds a new dimension.
         if args.use_K:
             print('get rays K')
-            rays = [NERFCO.nerf_renderer.get_rays_np_K(H, W, K, p) for p in poses[:, :3, :4]]
+            rays = [NERFCO.nerf_renderer.get_rays_tf_K(H, W, K, p) for p in poses[:, :3, :4]]
         else:
             print('get rays')
             rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
@@ -639,7 +641,7 @@ def train():
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
         #
-        if args.depth_from_camera:
+        if args.depth_from_camera and args.depth_loss:
             train_depths = np.stack([depth_maps[i] for i in i_train], axis=0).ravel()  # train images only
 
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], axis=0)  # train images only
@@ -700,7 +702,7 @@ def train():
                 if enable_keypoints:
                     train_keypoint_masks = shuffler(train_keypoint_masks, permutations)
 
-                if args.depth_from_camera:
+                if args.depth_from_camera and args.depth_loss:
                     train_depths = shuffler(train_depths, permutations)
 
                 i_batch = 0
@@ -716,14 +718,14 @@ def train():
             if enable_keypoints:
                 keypoint_masks_batch = train_keypoint_masks[i_batch: i_batch + N_rand]
 
-            if args.depth_from_camera:
+            if args.depth_from_camera and args.depth_loss:
                 train_depths_batch = train_depths[i_batch: i_batch + N_rand]
 
             i_batch += N_rand
 
             # batch_rays[i, n, xyz] = ray origin or direction, example_id, 3D position
             # target_s[n, rgb] = example_id, observed color.
-            if False: # args.depth_from_camera:
+            if args.depth_from_camera and args.depth_loss:
                 batch_rays, target_s = (batch[0], batch[0], train_depths_batch), batch[2]
             else:
                 batch_rays, target_s = batch[:2], batch[2]
@@ -817,7 +819,7 @@ def train():
                                                                                           extras['keypoint_map_0'])
                     loss += keypoint_loss_coeff * coarse_keypoint_loss
 
-                if args.depth_from_camera:
+                if args.depth_from_camera and args.depth_loss:
                     loss += tf.losses.huber_loss(train_depths_batch, extras['depth_map'])
 
         gradients = nerf_gradient_tape.gradient(loss, grad_vars)

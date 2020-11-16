@@ -200,4 +200,8 @@ def config_parser():
 
     parser.add_argument("--far", type=float, default=None, help='far')
 
+    parser.add_argument("--frames_field", type=str, default='frames', help='frames_field in transforms file')
+
+    parser.add_argument("--depth_loss", action='store_true', help='use depth_from_camera in rendering')
+
     return parser
